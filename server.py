@@ -1,19 +1,6 @@
 """
-server.py
----------
-CS432 Project — Secure Channel Broadcast Server
-
-Implements:
-    * Enrollment (RSA-OAEP encrypted requests, signed responses)
-    * Authentication via challenge-response (HMAC over a 128-bit nonce)
-    * Per-channel master-secret-derived AES/HMAC keys (IF100, MATH101, SPS101)
-    * Encrypted-and-signed authentication acknowledgments
-    * Encrypted broadcast relay (server does NOT decrypt or verify)
-    * Persistent enrollment database in JSON
-    * Tkinter GUI with full per-channel and master log
-
-Run:
-    python3 server.py
+secure channel server — cs432 project
+enrollment, challenge-response auth, broadcast relay + tkinter gui
 """
 
 import json
@@ -27,56 +14,41 @@ from tkinter import filedialog, messagebox, ttk
 import crypto_utils as cu
 
 
-# Default file name for the persistent enrollment store
 ENROLLMENT_DB_FILE = "server_enrollments.json"
 
 
-# =============================================================================
-# Server core (network + protocol logic)
-# =============================================================================
+# --- server core ---
 class SecureChannelServer:
     """
-    Holds the protocol state for the server: enrollment DB, channel keys,
-    active connections. The Tk GUI drives this object via methods, and this
-    object reports activity through a logging callback (`log_cb`) and a
-    structured-event callback (`event_cb`) used by the GUI.
+    protocol state for the server: enrollment db, channel keys, active conns.
+    gui drives this via methods, we report back via log_cb / event_cb.
     """
 
     def __init__(self, log_cb, event_cb):
-        # log_cb(target: str, message: str)
-        # target is one of {"server", "IF100", "MATH101", "SPS101"}
+        # log_cb(target, msg) — target is "server" or a channel name
         self.log_cb = log_cb
-        # event_cb(name: str, payload: dict) for GUI side-effects (online list etc.)
         self.event_cb = event_cb
 
-        # RSA key objects
-        self.enc_dec_key = None       # private+public, for decrypting enrollment & encrypting responses
-        self.sign_key = None          # private+public, for signing
+        # rsa keys
+        self.enc_dec_key = None       # decrypt enrollment, encrypt responses
+        self.sign_key = None          # sign outgoing messages
 
-        # Listening socket and thread
         self._listen_sock = None
         self._listen_thread = None
         self._running = False
 
-        # Persistent enrollment DB:
-        #   {username: {h_pw_hex, h_rev_pw_hex, channel}}
+        # {username: {h_pw_hex, h_rev_pw_hex, channel}}
         self._db_lock = threading.Lock()
         self.enrollments = self._load_db()
 
-        # Per-channel keys (set via "Generate Keys" GUI buttons):
-        #   {channel: {"aes_key": bytes, "iv": bytes, "hmac_key": bytes,
-        #              "master_hex": str (for display)}}
+        # {channel: {"aes_key", "iv", "hmac_key", "master_hex"}}
         self._channel_lock = threading.Lock()
         self.channel_keys = {}
 
-        # Active authenticated clients:
-        #   {username: {"sock": socket, "channel": str, "addr": (ip, port)}}
+        # {username: {"sock", "channel", "addr"}}
         self._conn_lock = threading.Lock()
         self.active = {}
 
-    # -------------------------------------------------------------------------
-    # Persistent enrollment DB
-    # -------------------------------------------------------------------------
     def _load_db(self):
         if not os.path.exists(ENROLLMENT_DB_FILE):
             return {}
@@ -90,11 +62,8 @@ class SecureChannelServer:
         with open(ENROLLMENT_DB_FILE, "w", encoding="utf-8") as f:
             json.dump(self.enrollments, f, indent=2)
 
-    # -------------------------------------------------------------------------
-    # RSA key loading
-    # -------------------------------------------------------------------------
     def load_rsa_keys(self, enc_dec_path: str, sign_path: str) -> None:
-        """Load the server's two RSA-3072 key pairs from PEM files."""
+        """load both rsa-3072 key pairs from pem files."""
         self.enc_dec_key = cu.load_rsa_key_from_file(enc_dec_path)
         self.sign_key = cu.load_rsa_key_from_file(sign_path)
         self.log_cb("server", f"Loaded enc/dec key from: {enc_dec_path}")
@@ -106,18 +75,10 @@ class SecureChannelServer:
         self.log_cb("server", f"  public  e  (hex): {cu.to_hex(self.sign_key.e.to_bytes((self.sign_key.e.bit_length() + 7) // 8, 'big'))}")
         self.log_cb("server", f"  private d  (hex): {cu.to_hex(self.sign_key.d.to_bytes(384, 'big'))}")
 
-    # -------------------------------------------------------------------------
-    # Channel key generation (server-only, in-memory)
-    # -------------------------------------------------------------------------
     def generate_channel_keys(self, channel: str, master_secret: str) -> None:
         """
-        Deterministically derive AES-256 key, IV, and HMAC key for one channel.
-            h  = SHA3-512(master_secret)
-            aes_key = h[0:32], iv = h[32:48], (h[48:64] discarded)
-            hr = SHA3-512(reverse(master_secret))
-            hmac_key = hr[0:32]
-        Once generated for a channel, the keys are FIXED for the lifetime of the
-        server (re-generation is rejected to satisfy the spec).
+        derive aes key, iv, hmac key from the master secret.
+        keys are fixed once set — re-generation is rejected per spec.
         """
         if channel not in cu.CHANNELS:
             raise ValueError(f"Unknown channel: {channel}")
@@ -149,11 +110,8 @@ class SecureChannelServer:
         self.log_cb(channel, f"Derived HMAC key:     {cu.to_hex(hmac_key)}")
         self.event_cb("channel_keys_ready", {"channel": channel})
 
-    # -------------------------------------------------------------------------
-    # Listening
-    # -------------------------------------------------------------------------
     def start(self, port: int) -> None:
-        """Start the listening socket and accept thread."""
+        """start listening and spawn the accept thread."""
         if self.enc_dec_key is None or self.sign_key is None:
             raise RuntimeError("RSA keys must be loaded before starting the server.")
         if self._running:
@@ -169,7 +127,7 @@ class SecureChannelServer:
         self.log_cb("server", f"Server listening on 0.0.0.0:{port}")
 
     def stop(self) -> None:
-        """Stop accepting and disconnect every active client."""
+        """stop accepting and kick all active clients."""
         if not self._running:
             return
         self._running = False
@@ -182,9 +140,8 @@ class SecureChannelServer:
         except OSError:
             pass
 
-        # Close every active connection so clients notice the server is down.
-        # We shutdown(SHUT_RDWR) FIRST so any thread blocked in recv() on the
-        # server side breaks out, AND the kernel sends a FIN to the client end.
+        # shutdown before close so threads blocked in recv() wake up
+        # and the kernel sends FIN to the other end
         with self._conn_lock:
             users = list(self.active.items())
         for username, info in users:
@@ -206,7 +163,7 @@ class SecureChannelServer:
             try:
                 client_sock, addr = self._listen_sock.accept()
             except OSError:
-                # listening socket was closed
+                # socket was closed, time to stop
                 break
             self.log_cb("server", f"Incoming connection from {addr[0]}:{addr[1]}")
             t = threading.Thread(
@@ -214,14 +171,10 @@ class SecureChannelServer:
             )
             t.start()
 
-    # -------------------------------------------------------------------------
-    # Per-connection handler
-    # -------------------------------------------------------------------------
     def _client_thread(self, sock: socket.socket, addr) -> None:
         """
-        Handle one client connection. The first message determines the flow:
-            type == "ENROLL_REQ"    -> one-shot enrollment exchange
-            type == "AUTH_REQ"      -> challenge-response then broadcast loop
+        handles one connection. first message decides the flow:
+        ENROLL_REQ -> one-shot enrollment, AUTH_REQ -> auth then broadcast loop.
         """
         username = None
         channel = None
@@ -231,7 +184,7 @@ class SecureChannelServer:
 
             if mtype == "ENROLL_REQ":
                 self._handle_enrollment(sock, first, addr)
-                # Enrollment is one-shot: close after responding.
+                # one-shot, close after
                 return
 
             if mtype == "AUTH_REQ":
@@ -239,7 +192,6 @@ class SecureChannelServer:
                 if login_result is None:
                     return
                 username, channel = login_result
-                # Now in broadcast phase.
                 self._broadcast_loop(sock, username, channel)
                 return
 
@@ -247,7 +199,7 @@ class SecureChannelServer:
         except (ConnectionError, OSError, ValueError) as e:
             self.log_cb("server", f"Connection error with {addr}: {e}")
         finally:
-            # Cleanup: if this was an authenticated session, drop it.
+            # drop from active sessions if this was an authenticated conn
             if username is not None:
                 with self._conn_lock:
                     if username in self.active and self.active[username]["sock"] is sock:
@@ -262,14 +214,8 @@ class SecureChannelServer:
             except OSError:
                 pass
 
-    # -------------------------------------------------------------------------
-    # Enrollment handling
-    # -------------------------------------------------------------------------
     def _handle_enrollment(self, sock: socket.socket, msg: dict, addr) -> None:
-        """
-        Decrypt the OAEP-encrypted enrollment payload, validate uniqueness,
-        store the user, and send a signed success/error response.
-        """
+        """decrypt the enrollment payload, check uniqueness, store user, send signed response."""
         try:
             ciphertext = cu.from_hex(msg["payload_hex"])
         except (KeyError, ValueError):
@@ -296,7 +242,6 @@ class SecureChannelServer:
         h_pw_hex = cu.to_hex(h_pw)
         h_rev_pw_hex = cu.to_hex(h_rev_pw)
 
-        # Log the parsed enrollment data
         self.log_cb("server", "[Enrollment] Decrypted payload:")
         self.log_cb("server", f"  username: {username}")
         self.log_cb("server", f"  channel:  {channel}")
@@ -335,7 +280,7 @@ class SecureChannelServer:
         )
 
     def _send_signed_text(self, sock: socket.socket, text: str) -> None:
-        """Send a plain text response with the server's RSA signature."""
+        """send a text response with the server's rsa signature."""
         text_bytes = text.encode("utf-8")
         sig = cu.rsa_sign(self.sign_key, text_bytes)
         self.log_cb("server", f"[Enrollment] Sending signed response: '{text}'")
@@ -349,36 +294,24 @@ class SecureChannelServer:
             },
         )
 
-    # -------------------------------------------------------------------------
-    # Authentication handling
-    # -------------------------------------------------------------------------
     def _handle_authentication(self, sock: socket.socket, msg: dict, addr):
-        """
-        Perform the challenge-response protocol. Returns (username, channel) on
-        success, else None.
-        """
+        """challenge-response auth. returns (username, channel) on success, None otherwise."""
         username = msg.get("username", "").strip()
         self.log_cb("server", f"[Auth] Authentication request for username '{username}' from {addr}")
 
-        # Find user record.
         with self._db_lock:
             user_record = self.enrollments.get(username)
 
         if user_record is None:
-            # The spec says we should still go through the motions to avoid
-            # leaking which usernames exist, but in practice for this project
-            # we can return a clean failure. We choose to send a challenge,
-            # then a generic "Authentication Unsuccessful" so the client has a
-            # uniform protocol.
+            # still send a challenge so we don't leak which usernames exist
             self.log_cb("server", f"[Auth] No such user '{username}'. Will fail HMAC.")
-            user_record = None
 
-        # Step 1: server -> client : 128-bit random challenge (cleartext)
+        # step 1: send 128-bit challenge
         challenge = cu.csprng_bytes(cu.NONCE_LEN)
         self.log_cb("server", f"[Auth] Generated 128-bit challenge: {cu.to_hex(challenge)}")
         cu.send_msg(sock, {"type": "AUTH_CHALLENGE", "challenge_hex": cu.to_hex(challenge)})
 
-        # Step 2: client -> server : HMAC of challenge using lower 32 bytes of h(pw)
+        # step 2: get the hmac back
         resp = cu.recv_msg(sock)
         if resp.get("type") != "AUTH_HMAC":
             self.log_cb("server", "[Auth] Expected AUTH_HMAC, got something else. Aborting.")
@@ -386,7 +319,7 @@ class SecureChannelServer:
         client_mac_hex = resp.get("hmac_hex", "")
         self.log_cb("server", f"[Auth] Received HMAC from client: {client_mac_hex}")
 
-        # Step 3: verify HMAC
+        # step 3: verify hmac
         ok = False
         if user_record is not None:
             h_pw = cu.from_hex(user_record["h_pw_hex"])
@@ -398,18 +331,16 @@ class SecureChannelServer:
             except ValueError:
                 ok = False
 
-        # Determine the AES key and IV used to encrypt the result. These come
-        # from h(rev_pw), which we stored at enrollment.
+        # ack key comes from h(rev_pw) stored at enrollment
         if user_record is not None:
             h_rev_pw = cu.from_hex(user_record["h_rev_pw_hex"])
             ack_aes_key, ack_iv = cu.derive_aes_key_iv_from_hash(h_rev_pw)
         else:
-            # No user record: invent a placeholder so the wire protocol is
-            # uniform. The client won't be able to decrypt it; that's fine.
+            # no record — use random key so the protocol stays uniform
             ack_aes_key = cu.csprng_bytes(cu.AES_KEY_LEN)
             ack_iv = cu.csprng_bytes(cu.AES_BLOCK_SIZE)
 
-        # Step 4a: HMAC failed -> encrypted+signed "Authentication Unsuccessful"
+        # step 4a: hmac failed
         if not ok:
             self.log_cb("server", "[Auth] HMAC verification FAILED.")
             ct = cu.aes_encrypt(ack_aes_key, ack_iv, cu.AUTH_FAIL_TEXT)
@@ -426,7 +357,7 @@ class SecureChannelServer:
             )
             return None
 
-        # Step 4b: HMAC OK. Now check that channel keys exist.
+        # step 4b: hmac ok — check channel keys
         self.log_cb("server", f"[Auth] HMAC verified OK for user '{username}'.")
         channel = user_record["channel"]
 
@@ -450,7 +381,7 @@ class SecureChannelServer:
             )
             return None
 
-        # Refuse if user already has an active session.
+        # reject duplicate sessions
         with self._conn_lock:
             if username in self.active:
                 self.log_cb(
@@ -471,11 +402,7 @@ class SecureChannelServer:
             self.active[username] = {"sock": sock, "channel": channel, "addr": (addr[0], addr[1])}
         self.event_cb("active_changed", {})
 
-        # Build the success payload:
-        #     "Authentication Successful" || aes_key (32) || iv (16) ||
-        #     hmac_key (32) || channel_name_bytes
-        # The channel name lets the client display it without storing
-        # anything locally besides the password input.
+        # success payload: auth ok text + channel keys + channel name
         payload = (
             cu.AUTH_OK_TEXT
             + ckeys["aes_key"]
@@ -502,9 +429,6 @@ class SecureChannelServer:
         )
         return username, channel
 
-    # -------------------------------------------------------------------------
-    # Broadcast loop (server only relays; never decrypts/verifies)
-    # -------------------------------------------------------------------------
     def _broadcast_loop(self, sock: socket.socket, username: str, channel: str) -> None:
         while True:
             try:
@@ -529,7 +453,7 @@ class SecureChannelServer:
                 self.log_cb("server", f"Unknown message type from '{username}': {mtype}")
 
     def _relay(self, channel: str, sender: str, ciphertext_hex: str, hmac_hex: str) -> None:
-        """Forward to every connected client subscribed to the same channel."""
+        """forward to everyone on the same channel. server never decrypts."""
         with self._conn_lock:
             recipients = [
                 (uname, info["sock"])
@@ -552,9 +476,6 @@ class SecureChannelServer:
                 pass
         self.log_cb(channel, f"-> Relayed message from '{sender}' to {delivered} subscriber(s).")
 
-    # -------------------------------------------------------------------------
-    # Inspection helpers
-    # -------------------------------------------------------------------------
     def list_active(self):
         with self._conn_lock:
             return [
@@ -567,41 +488,35 @@ class SecureChannelServer:
             return [(u, rec["channel"]) for u, rec in self.enrollments.items()]
 
 
-# =============================================================================
-# Tkinter GUI
-# =============================================================================
+# --- gui ---
 class ServerGUI:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("CS432 Project — Secure Channel Server")
         self.root.geometry("1100x780")
 
-        # Bridge to dispatch worker-thread updates onto the Tk main thread.
+        # queue for cross-thread updates
         self._gui_q = queue.Queue()
         self.root.after(50, self._poll_gui_queue)
 
-        # Channel-specific text widgets keyed by channel name; "server" -> master log.
+        # log widgets keyed by channel name; "server" -> master log
         self._log_widgets = {}
 
-        # The core protocol object
         self.core = SecureChannelServer(
             log_cb=self._log_threadsafe,
             event_cb=self._event_threadsafe,
         )
 
-        # State for path entries
         self._enc_dec_path = tk.StringVar()
         self._sign_path = tk.StringVar()
         self._port_var = tk.StringVar(value="6000")
 
-        # Per-channel master secret entry
         self._master_secrets = {ch: tk.StringVar() for ch in cu.CHANNELS}
         self._master_status = {ch: tk.StringVar(value="not generated") for ch in cu.CHANNELS}
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    # ------------------------------- UI layout -------------------------------
     def _build_ui(self):
         pad = {"padx": 6, "pady": 4}
 
@@ -637,17 +552,16 @@ class ServerGUI:
             ttk.Button(ms, text="Generate Keys", command=lambda c=ch: self._on_generate(c)).grid(row=i, column=2, padx=4)
             ttk.Label(ms, textvariable=self._master_status[ch], foreground="#444", width=20).grid(row=i, column=3, sticky="w")
 
-        # --- Active clients ---
+        # active clients
         active = ttk.LabelFrame(self.root, text="Online clients")
         active.pack(fill=tk.X, **pad)
         self._active_list = tk.Listbox(active, height=4)
         self._active_list.pack(fill=tk.X, padx=4, pady=4)
 
-        # --- Logs notebook ---
+        # logs
         nb = ttk.Notebook(self.root)
         nb.pack(fill=tk.BOTH, expand=True, **pad)
 
-        # One tab per channel (shows messages / relays for that channel)
         for ch in cu.CHANNELS:
             frame = ttk.Frame(nb)
             txt = tk.Text(frame, wrap=tk.WORD, height=18)
@@ -658,7 +572,7 @@ class ServerGUI:
             nb.add(frame, text=f"Channel {ch}")
             self._log_widgets[ch] = txt
 
-        # The server-wide log (RSA keys, enrollment, auth flow, errors)
+        # server-wide log tab
         frame_s = ttk.Frame(nb)
         txt_s = tk.Text(frame_s, wrap=tk.WORD, height=18)
         scr_s = ttk.Scrollbar(frame_s, command=txt_s.yview)
@@ -668,7 +582,6 @@ class ServerGUI:
         nb.add(frame_s, text="Server Log")
         self._log_widgets["server"] = txt_s
 
-    # ------------------------------ Callbacks --------------------------------
     def _browse_enc_dec(self):
         p = filedialog.askopenfilename(
             title="Select Enc/Dec PEM (private+public)",
@@ -731,9 +644,8 @@ class ServerGUI:
             pass
         self.root.destroy()
 
-    # --------------------- Thread-safe GUI update plumbing -------------------
+    # thread-safe updates
     def _log_threadsafe(self, target: str, message: str):
-        # Posted from worker threads; runs on Tk main thread when polled.
         self._gui_q.put(("log", target, message))
 
     def _event_threadsafe(self, name: str, payload: dict):
@@ -761,7 +673,6 @@ class ServerGUI:
         for uname, ch, addr in self.core.list_active():
             self._active_list.insert(tk.END, f"{uname}  ({ch})  from {addr[0]}:{addr[1]}")
 
-    # --------------------------------- run -----------------------------------
     def run(self):
         self.root.mainloop()
 

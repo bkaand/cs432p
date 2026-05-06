@@ -1,16 +1,6 @@
 """
-client.py
----------
-CS432 Project — Secure Channel Broadcast Client
-
-Implements:
-    * Enrollment (RSA-OAEP encrypted to server, signed reply verification)
-    * Authentication (challenge-response, AES+RSA-signed acknowledgment)
-    * Encrypted+HMAC'd broadcast send and receive
-    * Tkinter GUI with full crypto-detail logging
-
-Run:
-    python3 client.py
+secure channel client — cs432 project
+enrollment, auth, broadcast recv/send + tkinter gui
 """
 
 import queue
@@ -22,39 +12,33 @@ from tkinter import filedialog, messagebox, ttk
 import crypto_utils as cu
 
 
-# =============================================================================
-# Client core
-# =============================================================================
+# --- client core ---
 class SecureChannelClient:
     """
-    Holds protocol state for one client. The GUI invokes its methods and the
-    core reports activity via the `log_cb` callback and a `state_cb` for
-    high-level state transitions ("AUTHENTICATED", "DISCONNECTED", etc).
+    holds state for one client session. gui calls in,
+    we report back via log_cb / state_cb / message_cb.
     """
 
     def __init__(self, log_cb, state_cb, message_cb):
-        self.log_cb = log_cb            # log_cb(text)
-        self.state_cb = state_cb        # state_cb(state, info_dict)
-        self.message_cb = message_cb    # message_cb(sender, plaintext)
+        self.log_cb = log_cb
+        self.state_cb = state_cb
+        self.message_cb = message_cb
 
-        # Server public keys (from PEM files)
-        self.server_enc_pub = None      # for encrypting to server
-        self.server_sign_pub = None     # for verifying server signatures
+        # server pubkeys, loaded from pem files
+        self.server_enc_pub = None      # encrypt to server
+        self.server_sign_pub = None     # verify server sigs
 
-        # Active session
+        # session state
         self.sock = None
         self.username = None
         self.channel = None
-        self.session_aes_key = None     # channel encryption key
-        self.session_iv = None          # channel IV
-        self.session_hmac_key = None    # channel HMAC key
+        self.session_aes_key = None     # channel aes key
+        self.session_iv = None
+        self.session_hmac_key = None
 
         self._recv_thread = None
-        self._connected = False         # broadcast-phase connection alive
+        self._connected = False         # true once in broadcast phase
 
-    # -------------------------------------------------------------------------
-    # Public-key loading
-    # -------------------------------------------------------------------------
     def load_server_pubkeys(self, enc_path: str, sign_path: str) -> None:
         self.server_enc_pub = cu.load_rsa_key_from_file(enc_path)
         self.server_sign_pub = cu.load_rsa_key_from_file(sign_path)
@@ -65,11 +49,8 @@ class SecureChannelClient:
         self.log_cb(f"  modulus n (hex): {cu.to_hex(self.server_sign_pub.n.to_bytes(384, 'big'))}")
         self.log_cb(f"  public  e (hex): {cu.to_hex(self.server_sign_pub.e.to_bytes((self.server_sign_pub.e.bit_length() + 7) // 8, 'big'))}")
 
-    # -------------------------------------------------------------------------
-    # Enrollment
-    # -------------------------------------------------------------------------
     def enroll(self, ip: str, port: int, username: str, password: str, channel: str) -> bool:
-        """Run a one-shot enrollment exchange. Returns True on success."""
+        """enroll the user. returns True if it worked."""
         if self.server_enc_pub is None or self.server_sign_pub is None:
             self.log_cb("ERROR: Server public keys not loaded.")
             return False
@@ -77,12 +58,12 @@ class SecureChannelClient:
             self.log_cb(f"ERROR: invalid channel: {channel}")
             return False
 
-        # Compute password-derived hashes locally.
+        # derive password hashes
         h_pw, h_rev_pw = cu.password_hashes(password)
         self.log_cb(f"[Enrollment] SHA3-512(password):           {cu.to_hex(h_pw)}")
         self.log_cb(f"[Enrollment] SHA3-512(reversed password):  {cu.to_hex(h_rev_pw)}")
 
-        # Pack payload into compact binary format that fits in RSA-3072+OAEP.
+        # pack into binary, has to fit in rsa-3072+oaep
         payload = cu.encode_enrollment(username, h_pw, h_rev_pw, channel)
 
         ct = cu.rsa_encrypt(self.server_enc_pub, payload)
@@ -124,19 +105,11 @@ class SecureChannelClient:
             return True
         return False
 
-    # -------------------------------------------------------------------------
-    # Authentication
-    # -------------------------------------------------------------------------
     def login(self, ip: str, port: int, username: str, password: str) -> str:
         """
-        Run the challenge-response authentication. Returns one of:
-            "ok"               -> authenticated and channel keys received
-            "wrong_password"   -> AES decryption of ack failed
-            "auth_failed"      -> server returned "Authentication Unsuccessful"
-            "channel_unavailable"
-            "network_error"
-        On "ok", the broadcast-phase socket is kept open and a receive thread
-        is started.
+        challenge-response auth. returns "ok", "wrong_password",
+        "auth_failed", "channel_unavailable", or "network_error".
+        on "ok" the socket stays open and recv thread is started.
         """
         if self.server_enc_pub is None or self.server_sign_pub is None:
             self.log_cb("ERROR: Server public keys not loaded.")
@@ -149,11 +122,11 @@ class SecureChannelClient:
             return "network_error"
 
         try:
-            # Step 1: send cleartext AUTH_REQ
+            # send auth request
             self.log_cb(f"[Auth] Sending AUTH_REQ for username '{username}'")
             cu.send_msg(sock, {"type": "AUTH_REQ", "username": username})
 
-            # Step 2: receive challenge
+            # wait for challenge
             chal_msg = cu.recv_msg(sock)
             if chal_msg.get("type") != "AUTH_CHALLENGE":
                 self.log_cb(f"[Auth] Unexpected: {chal_msg}")
@@ -163,7 +136,7 @@ class SecureChannelClient:
             challenge = cu.from_hex(chal_msg["challenge_hex"])
             self.log_cb(f"[Auth] Received 128-bit challenge: {cu.to_hex(challenge)}")
 
-            # Step 3: HMAC challenge with lower-half h(password)
+            # hmac the challenge with lower half of h(pw)
             h_pw, h_rev_pw = cu.password_hashes(password)
             hmac_key = cu.derive_hmac_key_from_hash(h_pw)
             mac = cu.hmac_sha3_512(hmac_key, challenge)
@@ -171,7 +144,7 @@ class SecureChannelClient:
             self.log_cb(f"[Auth] Sending HMAC-SHA3-512:        {cu.to_hex(mac)}")
             cu.send_msg(sock, {"type": "AUTH_HMAC", "hmac_hex": cu.to_hex(mac)})
 
-            # Step 4: receive AUTH_RESULT (encrypted ciphertext + signature)
+            # get the result
             res = cu.recv_msg(sock)
             if res.get("type") != "AUTH_RESULT":
                 self.log_cb(f"[Auth] Unexpected result message: {res}")
@@ -183,14 +156,14 @@ class SecureChannelClient:
             self.log_cb(f"[Auth] Result ciphertext: {cu.short_hex(ct)}")
             self.log_cb(f"[Auth] Result signature:  {cu.short_hex(sig)}")
 
-            # Verify the server's signature on the ciphertext FIRST.
+            # verify sig before touching the ciphertext
             if not cu.rsa_verify(self.server_sign_pub, ct, sig):
                 self.log_cb("[Auth] SIGNATURE INVALID on AUTH_RESULT. Discarding.")
                 sock.close()
                 return "auth_failed"
             self.log_cb("[Auth] Signature on result verified OK.")
 
-            # Decrypt with key/IV derived from h(rev_pw).
+            # decrypt with key derived from h(rev_pw)
             ack_key, ack_iv = cu.derive_aes_key_iv_from_hash(h_rev_pw)
             self.log_cb(f"[Auth] AES key for ack decryption: {cu.to_hex(ack_key)}")
             self.log_cb(f"[Auth] IV  for ack decryption:    {cu.to_hex(ack_iv)}")
@@ -233,19 +206,13 @@ class SecureChannelClient:
                 self.log_cb(f"[Auth] Channel IV:       {cu.to_hex(iv)}")
                 self.log_cb(f"[Auth] Channel HMAC key: {cu.to_hex(hmac_key_ch)}")
 
-                # Keep the socket open for broadcast phase.
-                # IMPORTANT: socket.create_connection(timeout=10) at login sets a
-                # 10s recv timeout on the socket itself (not just the connect op).
-                # Carrying that timeout into the broadcast phase would cause
-                # socket.timeout (a subclass of OSError) on every idle interval,
-                # silently disconnecting clients with no real network problem.
-                # Switch to blocking mode now that auth is done.
+                # keep socket open for broadcast phase
+                # clear the timeout — create_connection sets it on the socket itself,
+                # not just connect. leaving it would kill us on every idle interval.
                 sock.settimeout(None)
                 self.sock = sock
                 self._connected = True
-                # We learn our channel from the receive thread's first messages
-                # if needed; but since we know our own channel from enrollment,
-                # the GUI passes it in via _set_channel after login.
+                # channel comes from the auth payload
                 self._recv_thread = threading.Thread(target=self._receive_loop, daemon=True)
                 self._recv_thread.start()
                 return "ok"
@@ -271,12 +238,9 @@ class SecureChannelClient:
             return "network_error"
 
     def set_channel(self, channel: str):
-        """Called by the GUI right after a successful login (channel was chosen at enrollment)."""
+        """gui calls this after login to set which channel we're on."""
         self.channel = channel
 
-    # -------------------------------------------------------------------------
-    # Broadcast send / receive
-    # -------------------------------------------------------------------------
     def send_broadcast(self, message: str) -> bool:
         if not self._connected or self.session_aes_key is None:
             self.log_cb("Cannot send: not authenticated.")
@@ -363,20 +327,18 @@ class SecureChannelClient:
         self._mark_disconnected()
 
 
-# =============================================================================
-# Tkinter GUI
-# =============================================================================
+# --- gui ---
 class ClientGUI:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("CS432 Project — Secure Channel Client")
         self.root.geometry("1050x780")
 
-        # GUI-thread queue for cross-thread updates
+        # queue for cross-thread updates
         self._gui_q = queue.Queue()
         self.root.after(50, self._poll_gui_queue)
 
-        # Form variables
+        # form vars
         self._enc_pub_path = tk.StringVar()
         self._sign_pub_path = tk.StringVar()
         self._ip_var = tk.StringVar(value="127.0.0.1")
@@ -389,7 +351,6 @@ class ClientGUI:
         self._login_user = tk.StringVar()
         self._login_pass = tk.StringVar()
 
-        # Core
         self.core = SecureChannelClient(
             log_cb=self._log_threadsafe,
             state_cb=self._state_threadsafe,
@@ -399,11 +360,10 @@ class ClientGUI:
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    # ------------------------------- UI layout -------------------------------
     def _build_ui(self):
         pad = {"padx": 6, "pady": 4}
 
-        # Top: keys + connection
+        # keys + connection at top
         top = ttk.LabelFrame(self.root, text="Server keys & connection")
         top.pack(fill=tk.X, **pad)
 
@@ -424,7 +384,6 @@ class ClientGUI:
             row=3, column=0, columnspan=4, sticky="we", padx=4, pady=4
         )
 
-        # Notebook: enrollment / login on left, message+log on right
         actions = ttk.Frame(self.root)
         actions.pack(fill=tk.X, **pad)
 
@@ -451,15 +410,13 @@ class ClientGUI:
         self._disconnect_btn = ttk.Button(log_f, text="Disconnect", command=self._on_disconnect, state=tk.DISABLED)
         self._disconnect_btn.grid(row=3, column=1, sticky="we", padx=4, pady=4)
 
-        # Status bar
+        # status bar
         self._status_var = tk.StringVar(value="Status: not connected")
         ttk.Label(self.root, textvariable=self._status_var, foreground="#0a0").pack(fill=tk.X, padx=8)
 
-        # Notebook: Channel | Log
         nb = ttk.Notebook(self.root)
         nb.pack(fill=tk.BOTH, expand=True, **pad)
 
-        # Channel tab
         ch_frame = ttk.Frame(nb)
         self._ch_label = ttk.Label(ch_frame, text="Channel: (not authenticated)", font=("TkDefaultFont", 11, "bold"))
         self._ch_label.pack(anchor="w", padx=6, pady=4)
@@ -483,7 +440,6 @@ class ClientGUI:
 
         nb.add(ch_frame, text="Channel")
 
-        # Log tab
         log_frame = ttk.Frame(nb)
         self._log_widget = tk.Text(log_frame, wrap=tk.WORD, height=20)
         scrl = ttk.Scrollbar(log_frame, command=self._log_widget.yview)
@@ -492,7 +448,6 @@ class ClientGUI:
         scrl.pack(side=tk.RIGHT, fill=tk.Y)
         nb.add(log_frame, text="Crypto Log")
 
-    # ------------------------------ Callbacks --------------------------------
     def _browse_enc_pub(self):
         p = filedialog.askopenfilename(
             title="Select server enc PUBLIC key (PEM)",
@@ -548,14 +503,14 @@ class ClientGUI:
             messagebox.showerror("Bad channel", "Channel must be IF100 / MATH101 / SPS101.")
             return
 
-        # Run in a worker thread to avoid blocking the GUI on the network call.
+        # run in a thread so we don't freeze the gui
         def worker():
             ok = self.core.enroll(ip, port, username, password, channel)
             if ok:
                 self._gui_q.put(("info", "Enrollment success", f"User '{username}' enrolled on {channel}."))
             else:
                 self._gui_q.put(("error", "Enrollment failed", "See the log for details."))
-            # Don't keep the password in the form.
+            # clear the password field
             self._gui_q.put(("clear_reg_pass", None, None))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -575,7 +530,7 @@ class ClientGUI:
             messagebox.showerror("Missing", "Username and password are required.")
             return
 
-        # Disable login button while we work.
+        # disable button while we're working
         self._login_btn.configure(state=tk.DISABLED)
         self._set_status(f"Status: authenticating as '{username}'...")
 
@@ -603,7 +558,7 @@ class ClientGUI:
             pass
         self.root.destroy()
 
-    # ----------------------- Thread-safe GUI update plumbing -----------------
+    # thread-safe updates
     def _log_threadsafe(self, message: str):
         self._gui_q.put(("log", message, None))
 
@@ -657,15 +612,8 @@ class ClientGUI:
 
     def _handle_login_result(self, result: str, username: str):
         if result == "ok":
-            # Look up the channel by asking the core (we know it from enrollment).
-            # Prefer to fetch from local DB if available; otherwise rely on the
-            # AUTH_OK message. We stored channel inside enrollment; here we
-            # just trust the user's enrollment record by querying the server's
-            # response indirectly. Simpler: read from the core.
-            channel = self.core.channel  # may be None until first received message
-            # If unknown, fall back: ask the user to remember from enrollment.
-            # Most robust: have the core remember the channel from the auth flow.
-            # Since the server keeps the channel mapping, we surface it here.
+            # channel is set from the auth payload
+            channel = self.core.channel  # might be None
             self._login_user.set(username)
             self._send_btn.configure(state=tk.NORMAL)
             self._disconnect_btn.configure(state=tk.NORMAL)
