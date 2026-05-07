@@ -632,11 +632,91 @@ class SecureChannelServer:
 
 
 # --- gui ---
+
+# dark / red palette
+_S_BG     = "#0f0e17"
+_S_BG2    = "#1a1929"
+_S_BG3    = "#241f3a"
+_S_ACCENT = "#ff3b5c"
+_S_ACCT2  = "#ff7096"
+_S_TEXT   = "#f8f8ff"
+_S_DIM    = "#9b96b0"
+_S_GREEN  = "#2ed573"
+_S_FONT   = ("Segoe UI", 10) if tk.TkVersion else ("TkDefaultFont", 10)
+_S_MONO   = ("Consolas", 10) if tk.TkVersion else ("Courier", 10)
+
+
+def _server_style(root):
+    s = ttk.Style(root)
+    s.theme_use("clam")
+    s.configure(".",
+        background=_S_BG, foreground=_S_TEXT,
+        troughcolor=_S_BG2, bordercolor=_S_BG3,
+        darkcolor=_S_BG2, lightcolor=_S_BG3,
+        selectbackground=_S_ACCENT, selectforeground=_S_TEXT,
+    )
+    s.configure("TFrame",            background=_S_BG)
+    s.configure("Card.TFrame",       background=_S_BG2)
+    s.configure("TLabel",            background=_S_BG,  foreground=_S_TEXT)
+    s.configure("Card.TLabel",       background=_S_BG2, foreground=_S_TEXT)
+    s.configure("Dim.TLabel",        background=_S_BG2, foreground=_S_DIM)
+    s.configure("TLabelframe",
+        background=_S_BG2, foreground=_S_ACCENT,
+        bordercolor=_S_BG3, relief="groove",
+    )
+    s.configure("TLabelframe.Label",
+        background=_S_BG2, foreground=_S_ACCENT,
+        font=(_S_FONT[0], 9, "bold"),
+    )
+    s.configure("TButton",
+        background=_S_ACCENT, foreground=_S_TEXT,
+        borderwidth=0, relief="flat", padding=(10, 5),
+        font=(_S_FONT[0], 9, "bold"),
+    )
+    s.map("TButton",
+        background=[("active", _S_ACCT2), ("disabled", _S_BG3)],
+        foreground=[("disabled", _S_DIM)],
+    )
+    s.configure("TEntry",
+        fieldbackground=_S_BG3, foreground=_S_TEXT,
+        bordercolor=_S_BG3, insertcolor=_S_TEXT,
+    )
+    s.configure("TCombobox",
+        fieldbackground=_S_BG3, foreground=_S_TEXT,
+        selectbackground=_S_ACCENT, selectforeground=_S_TEXT,
+        arrowcolor=_S_TEXT, bordercolor=_S_BG3,
+    )
+    s.map("TCombobox",
+        fieldbackground=[("readonly", _S_BG3)],
+        selectbackground=[("readonly", _S_ACCENT)],
+    )
+    s.configure("TNotebook",
+        background=_S_BG, bordercolor=_S_BG3, tabmargins=[2, 4, 2, 0],
+    )
+    s.configure("TNotebook.Tab",
+        background=_S_BG3, foreground=_S_DIM,
+        padding=[14, 6], borderwidth=0,
+        font=(_S_FONT[0], 9, "bold"),
+    )
+    s.map("TNotebook.Tab",
+        background=[("selected", _S_ACCENT)],
+        foreground=[("selected", _S_TEXT)],
+        expand=[("selected", [1, 1, 1, 0])],
+    )
+    s.configure("Vertical.TScrollbar",
+        background=_S_BG3, troughcolor=_S_BG2,
+        bordercolor=_S_BG2, arrowcolor=_S_DIM,
+        relief="flat",
+    )
+
+
 class ServerGUI:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("CS432 Project — Secure Channel Server")
-        self.root.geometry("1100x780")
+        self.root.title("CS432 — Secure Channel SERVER")
+        self.root.geometry("1140x860")
+        self.root.configure(bg=_S_BG)
+        _server_style(self.root)
 
         self._gui_q = queue.Queue()
         self.root.after(50, self._poll_gui_queue)
@@ -659,63 +739,121 @@ class ServerGUI:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_ui(self):
-        pad = {"padx": 6, "pady": 4}
+        # ── Header banner ──────────────────────────────────────────────
+        banner = tk.Frame(self.root, bg=_S_ACCENT, height=58)
+        banner.pack(fill=tk.X)
+        banner.pack_propagate(False)
+        tk.Label(
+            banner, text="  SERVER",
+            bg=_S_ACCENT, fg=_S_TEXT,
+            font=(_S_FONT[0], 17, "bold"),
+        ).pack(side=tk.LEFT, padx=18)
+        tk.Label(
+            banner, text="CS432 Secure Channel",
+            bg=_S_ACCENT, fg=_S_BG,
+            font=(_S_FONT[0], 10),
+        ).pack(side=tk.LEFT, padx=4)
+        self._status_badge = tk.Label(
+            banner, text="● OFFLINE",
+            bg=_S_BG, fg=_S_ACCT2,
+            font=(_S_FONT[0], 9, "bold"),
+            padx=10, pady=4,
+        )
+        self._status_badge.pack(side=tk.RIGHT, padx=18, pady=10)
 
-        setup = ttk.LabelFrame(self.root, text="Server Setup")
-        setup.pack(fill=tk.X, **pad)
+        body = tk.Frame(self.root, bg=_S_BG)
+        body.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
 
-        ttk.Label(setup, text="Listening port:").grid(row=0, column=0, sticky="e", padx=4, pady=4)
-        ttk.Entry(setup, textvariable=self._port_var, width=8).grid(row=0, column=1, sticky="w")
+        # ── Server setup ───────────────────────────────────────────────
+        setup = ttk.LabelFrame(body, text="SERVER SETUP")
+        setup.pack(fill=tk.X, pady=(0, 6))
 
-        ttk.Label(setup, text="Enc/Dec key (PEM):").grid(row=1, column=0, sticky="e", padx=4, pady=4)
-        ttk.Entry(setup, textvariable=self._enc_dec_path, width=70).grid(row=1, column=1, columnspan=2, sticky="we")
-        ttk.Button(setup, text="Browse", command=self._browse_enc_dec).grid(row=1, column=3, padx=4)
+        ttk.Label(setup, text="Port:", style="Card.TLabel").grid(
+            row=0, column=0, sticky="e", padx=(10, 4), pady=5)
+        ttk.Entry(setup, textvariable=self._port_var, width=10).grid(
+            row=0, column=1, sticky="w", padx=4, pady=5)
 
-        ttk.Label(setup, text="Sign/Verify key (PEM):").grid(row=2, column=0, sticky="e", padx=4, pady=4)
-        ttk.Entry(setup, textvariable=self._sign_path, width=70).grid(row=2, column=1, columnspan=2, sticky="we")
-        ttk.Button(setup, text="Browse", command=self._browse_sign).grid(row=2, column=3, padx=4)
+        ttk.Label(setup, text="Enc/Dec key (PEM):", style="Card.TLabel").grid(
+            row=1, column=0, sticky="e", padx=(10, 4), pady=5)
+        ttk.Entry(setup, textvariable=self._enc_dec_path, width=66).grid(
+            row=1, column=1, columnspan=2, sticky="we", padx=4)
+        ttk.Button(setup, text="Browse", command=self._browse_enc_dec, width=8).grid(
+            row=1, column=3, padx=(4, 10))
 
-        btnbar = ttk.Frame(setup)
-        btnbar.grid(row=3, column=0, columnspan=4, sticky="we", pady=4)
-        self._start_btn = ttk.Button(btnbar, text="Start Server", command=self._on_start)
-        self._start_btn.pack(side=tk.LEFT, padx=4)
-        self._stop_btn = ttk.Button(btnbar, text="Stop Server", command=self._on_stop, state=tk.DISABLED)
-        self._stop_btn.pack(side=tk.LEFT, padx=4)
+        ttk.Label(setup, text="Sign/Verify key (PEM):", style="Card.TLabel").grid(
+            row=2, column=0, sticky="e", padx=(10, 4), pady=5)
+        ttk.Entry(setup, textvariable=self._sign_path, width=66).grid(
+            row=2, column=1, columnspan=2, sticky="we", padx=4)
+        ttk.Button(setup, text="Browse", command=self._browse_sign, width=8).grid(
+            row=2, column=3, padx=(4, 10))
 
-        ms = ttk.LabelFrame(self.root, text="Per-Channel Master Secret  (keys are derived once and remain fixed)")
-        ms.pack(fill=tk.X, **pad)
+        setup.columnconfigure(1, weight=1)
+
+        btnbar = tk.Frame(setup, bg=_S_BG2)
+        btnbar.grid(row=3, column=0, columnspan=4, sticky="we", padx=10, pady=(4, 10))
+        self._start_btn = ttk.Button(btnbar, text="▶  Start Server", command=self._on_start)
+        self._start_btn.pack(side=tk.LEFT, padx=(0, 8))
+        self._stop_btn = ttk.Button(btnbar, text="■  Stop Server", command=self._on_stop, state=tk.DISABLED)
+        self._stop_btn.pack(side=tk.LEFT)
+
+        # ── Channel master secrets ─────────────────────────────────────
+        ms = ttk.LabelFrame(body, text="PER-CHANNEL MASTER SECRET  (derived once, fixed for server lifetime)")
+        ms.pack(fill=tk.X, pady=(0, 6))
 
         for i, ch in enumerate(CHANNELS):
-            ttk.Label(ms, text=f"{ch}:", width=10).grid(row=i, column=0, sticky="e", padx=4, pady=2)
-            ttk.Entry(ms, textvariable=self._master_secrets[ch], width=40, show="*").grid(row=i, column=1, sticky="we")
-            ttk.Button(ms, text="Generate Keys", command=lambda c=ch: self._on_generate(c)).grid(row=i, column=2, padx=4)
-            ttk.Label(ms, textvariable=self._master_status[ch], foreground="#444", width=20).grid(row=i, column=3, sticky="w")
+            ttk.Label(ms, text=ch, style="Card.TLabel",
+                      font=(_S_FONT[0], 9, "bold"), width=10).grid(
+                row=i, column=0, sticky="e", padx=(10, 4), pady=4)
+            ttk.Entry(ms, textvariable=self._master_secrets[ch], width=40, show="*").grid(
+                row=i, column=1, sticky="we", padx=4)
+            ttk.Button(ms, text="Generate Keys",
+                       command=lambda c=ch: self._on_generate(c)).grid(
+                row=i, column=2, padx=4)
+            ttk.Label(ms, textvariable=self._master_status[ch],
+                      style="Dim.TLabel", width=18).grid(
+                row=i, column=3, sticky="w", padx=(4, 10))
+        ms.columnconfigure(1, weight=1)
 
-        active = ttk.LabelFrame(self.root, text="Online clients")
-        active.pack(fill=tk.X, **pad)
-        self._active_list = tk.Listbox(active, height=4)
-        self._active_list.pack(fill=tk.X, padx=4, pady=4)
+        # ── Online clients ─────────────────────────────────────────────
+        ac = ttk.LabelFrame(body, text="ONLINE CLIENTS")
+        ac.pack(fill=tk.X, pady=(0, 6))
+        self._active_list = tk.Listbox(
+            ac, height=3,
+            bg=_S_BG3, fg=_S_GREEN, selectbackground=_S_ACCENT,
+            relief="flat", borderwidth=0,
+            font=_S_MONO,
+        )
+        self._active_list.pack(fill=tk.X, padx=8, pady=6)
 
-        nb = ttk.Notebook(self.root)
-        nb.pack(fill=tk.BOTH, expand=True, **pad)
+        # ── Log tabs ───────────────────────────────────────────────────
+        nb = ttk.Notebook(body)
+        nb.pack(fill=tk.BOTH, expand=True, pady=(0, 2))
 
         for ch in CHANNELS:
             frame = ttk.Frame(nb)
-            txt = tk.Text(frame, wrap=tk.WORD, height=18)
+            txt = tk.Text(
+                frame, wrap=tk.WORD, height=12,
+                bg=_S_BG3, fg=_S_GREEN, insertbackground=_S_TEXT,
+                relief="flat", borderwidth=0, font=_S_MONO, padx=8, pady=6,
+            )
             scr = ttk.Scrollbar(frame, command=txt.yview)
             txt.configure(yscrollcommand=scr.set)
             txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
             scr.pack(side=tk.RIGHT, fill=tk.Y)
-            nb.add(frame, text=f"Channel {ch}")
+            nb.add(frame, text=f"  {ch}  ")
             self._log_widgets[ch] = txt
 
         frame_s = ttk.Frame(nb)
-        txt_s = tk.Text(frame_s, wrap=tk.WORD, height=18)
+        txt_s = tk.Text(
+            frame_s, wrap=tk.WORD, height=12,
+            bg=_S_BG3, fg=_S_ACCT2, insertbackground=_S_TEXT,
+            relief="flat", borderwidth=0, font=_S_MONO, padx=8, pady=6,
+        )
         scr_s = ttk.Scrollbar(frame_s, command=txt_s.yview)
         txt_s.configure(yscrollcommand=scr_s.set)
         txt_s.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scr_s.pack(side=tk.RIGHT, fill=tk.Y)
-        nb.add(frame_s, text="Server Log")
+        nb.add(frame_s, text="  Server Log  ")
         self._log_widgets["server"] = txt_s
 
     def _browse_enc_dec(self):
@@ -756,11 +894,13 @@ class ServerGUI:
 
         self._start_btn.configure(state=tk.DISABLED)
         self._stop_btn.configure(state=tk.NORMAL)
+        self._status_badge.configure(text="● ONLINE", fg=_S_GREEN)
 
     def _on_stop(self):
         self.core.stop()
         self._start_btn.configure(state=tk.NORMAL)
         self._stop_btn.configure(state=tk.DISABLED)
+        self._status_badge.configure(text="● OFFLINE", fg=_S_ACCT2)
 
     def _on_generate(self, channel: str):
         secret = self._master_secrets[channel].get()

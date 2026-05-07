@@ -471,11 +471,93 @@ class SecureChannelClient:
 
 
 # --- gui ---
+
+# light / sky-blue palette
+_C_BG     = "#f0f7ff"
+_C_BG2    = "#ffffff"
+_C_BG3    = "#dbeafe"
+_C_ACCENT = "#0ea5e9"
+_C_ACCT2  = "#38bdf8"
+_C_DARK   = "#0369a1"
+_C_TEXT   = "#0f172a"
+_C_DIM    = "#64748b"
+_C_GREEN  = "#059669"
+_C_WARN   = "#dc2626"
+_C_FONT   = ("Segoe UI", 10) if tk.TkVersion else ("TkDefaultFont", 10)
+_C_MONO   = ("Consolas", 10) if tk.TkVersion else ("Courier", 10)
+
+
+def _client_style(root):
+    s = ttk.Style(root)
+    s.theme_use("clam")
+    s.configure(".",
+        background=_C_BG, foreground=_C_TEXT,
+        troughcolor=_C_BG3, bordercolor=_C_BG3,
+        darkcolor=_C_BG3, lightcolor=_C_BG2,
+        selectbackground=_C_ACCENT, selectforeground=_C_BG2,
+    )
+    s.configure("TFrame",       background=_C_BG)
+    s.configure("Card.TFrame",  background=_C_BG2)
+    s.configure("TLabel",       background=_C_BG,  foreground=_C_TEXT)
+    s.configure("Card.TLabel",  background=_C_BG2, foreground=_C_TEXT)
+    s.configure("Dim.TLabel",   background=_C_BG2, foreground=_C_DIM)
+    s.configure("TLabelframe",
+        background=_C_BG2, foreground=_C_DARK,
+        bordercolor=_C_BG3, relief="groove",
+    )
+    s.configure("TLabelframe.Label",
+        background=_C_BG2, foreground=_C_DARK,
+        font=(_C_FONT[0], 9, "bold"),
+    )
+    s.configure("TButton",
+        background=_C_ACCENT, foreground=_C_BG2,
+        borderwidth=0, relief="flat", padding=(10, 5),
+        font=(_C_FONT[0], 9, "bold"),
+    )
+    s.map("TButton",
+        background=[("active", _C_DARK), ("disabled", _C_BG3)],
+        foreground=[("disabled", _C_DIM)],
+    )
+    s.configure("TEntry",
+        fieldbackground=_C_BG2, foreground=_C_TEXT,
+        bordercolor=_C_BG3, insertcolor=_C_TEXT,
+    )
+    s.configure("TCombobox",
+        fieldbackground=_C_BG2, foreground=_C_TEXT,
+        selectbackground=_C_ACCENT, selectforeground=_C_BG2,
+        arrowcolor=_C_ACCENT, bordercolor=_C_BG3,
+    )
+    s.map("TCombobox",
+        fieldbackground=[("readonly", _C_BG2)],
+        selectbackground=[("readonly", _C_ACCENT)],
+    )
+    s.configure("TNotebook",
+        background=_C_BG, bordercolor=_C_BG3, tabmargins=[2, 4, 2, 0],
+    )
+    s.configure("TNotebook.Tab",
+        background=_C_BG3, foreground=_C_DIM,
+        padding=[14, 6], borderwidth=0,
+        font=(_C_FONT[0], 9, "bold"),
+    )
+    s.map("TNotebook.Tab",
+        background=[("selected", _C_ACCENT)],
+        foreground=[("selected", _C_BG2)],
+        expand=[("selected", [1, 1, 1, 0])],
+    )
+    s.configure("Vertical.TScrollbar",
+        background=_C_BG3, troughcolor=_C_BG,
+        bordercolor=_C_BG, arrowcolor=_C_DIM,
+        relief="flat",
+    )
+
+
 class ClientGUI:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("CS432 Project — Secure Channel Client")
-        self.root.geometry("1050x780")
+        self.root.title("CS432 — Secure Channel CLIENT")
+        self.root.geometry("1080x860")
+        self.root.configure(bg=_C_BG)
+        _client_style(self.root)
 
         self._gui_q = queue.Queue()
         self.root.after(50, self._poll_gui_queue)
@@ -502,88 +584,156 @@ class ClientGUI:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_ui(self):
-        pad = {"padx": 6, "pady": 4}
-
-        top = ttk.LabelFrame(self.root, text="Server keys & connection")
-        top.pack(fill=tk.X, **pad)
-
-        ttk.Label(top, text="Enc public key (PEM):").grid(row=0, column=0, sticky="e", padx=4, pady=2)
-        ttk.Entry(top, textvariable=self._enc_pub_path, width=70).grid(row=0, column=1, columnspan=2, sticky="we")
-        ttk.Button(top, text="Browse", command=self._browse_enc_pub).grid(row=0, column=3, padx=4)
-
-        ttk.Label(top, text="Sign public key (PEM):").grid(row=1, column=0, sticky="e", padx=4, pady=2)
-        ttk.Entry(top, textvariable=self._sign_pub_path, width=70).grid(row=1, column=1, columnspan=2, sticky="we")
-        ttk.Button(top, text="Browse", command=self._browse_sign_pub).grid(row=1, column=3, padx=4)
-
-        ttk.Label(top, text="Server IP:").grid(row=2, column=0, sticky="e", padx=4, pady=2)
-        ttk.Entry(top, textvariable=self._ip_var, width=20).grid(row=2, column=1, sticky="w")
-        ttk.Label(top, text="Port:").grid(row=2, column=2, sticky="e", padx=4)
-        ttk.Entry(top, textvariable=self._port_var, width=8).grid(row=2, column=3, sticky="w")
-
-        ttk.Button(top, text="Load server keys", command=self._on_load_keys).grid(
-            row=3, column=0, columnspan=4, sticky="we", padx=4, pady=4
+        # ── Header banner ──────────────────────────────────────────────
+        banner = tk.Frame(self.root, bg=_C_ACCENT, height=58)
+        banner.pack(fill=tk.X)
+        banner.pack_propagate(False)
+        tk.Label(
+            banner, text="  CLIENT",
+            bg=_C_ACCENT, fg=_C_BG2,
+            font=(_C_FONT[0], 17, "bold"),
+        ).pack(side=tk.LEFT, padx=18)
+        tk.Label(
+            banner, text="CS432 Secure Channel",
+            bg=_C_ACCENT, fg=_C_BG,
+            font=(_C_FONT[0], 10),
+        ).pack(side=tk.LEFT, padx=4)
+        self._status_var = tk.StringVar(value="● Not connected")
+        self._status_badge = tk.Label(
+            banner, textvariable=self._status_var,
+            bg=_C_BG2, fg=_C_WARN,
+            font=(_C_FONT[0], 9, "bold"),
+            padx=10, pady=4,
         )
+        self._status_badge.pack(side=tk.RIGHT, padx=18, pady=10)
 
-        actions = ttk.Frame(self.root)
-        actions.pack(fill=tk.X, **pad)
+        body = tk.Frame(self.root, bg=_C_BG)
+        body.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
 
-        enr = ttk.LabelFrame(actions, text="Enrollment")
-        enr.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
-        ttk.Label(enr, text="Username:").grid(row=0, column=0, sticky="e", padx=4, pady=2)
-        ttk.Entry(enr, textvariable=self._reg_user, width=20).grid(row=0, column=1, sticky="w")
-        ttk.Label(enr, text="Password:").grid(row=1, column=0, sticky="e", padx=4, pady=2)
-        ttk.Entry(enr, textvariable=self._reg_pass, width=20, show="*").grid(row=1, column=1, sticky="w")
-        ttk.Label(enr, text="Channel:").grid(row=2, column=0, sticky="e", padx=4, pady=2)
-        ttk.Combobox(enr, textvariable=self._reg_channel, values=list(CHANNELS), state="readonly", width=18).grid(row=2, column=1, sticky="w")
-        ttk.Button(enr, text="Enroll", command=self._on_enroll).grid(row=3, column=0, columnspan=2, sticky="we", padx=4, pady=4)
+        # ── Server keys & connection ───────────────────────────────────
+        top = ttk.LabelFrame(body, text="SERVER KEYS & CONNECTION")
+        top.pack(fill=tk.X, pady=(0, 6))
 
-        log_f = ttk.LabelFrame(actions, text="Login")
-        log_f.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
-        ttk.Label(log_f, text="Username:").grid(row=0, column=0, sticky="e", padx=4, pady=2)
-        ttk.Entry(log_f, textvariable=self._login_user, width=20).grid(row=0, column=1, sticky="w")
-        ttk.Label(log_f, text="Password:").grid(row=1, column=0, sticky="e", padx=4, pady=2)
-        ttk.Entry(log_f, textvariable=self._login_pass, width=20, show="*").grid(row=1, column=1, sticky="w")
-        self._login_btn = ttk.Button(log_f, text="Login", command=self._on_login)
-        self._login_btn.grid(row=3, column=0, sticky="we", padx=4, pady=4)
-        self._disconnect_btn = ttk.Button(log_f, text="Disconnect", command=self._on_disconnect, state=tk.DISABLED)
-        self._disconnect_btn.grid(row=3, column=1, sticky="we", padx=4, pady=4)
+        ttk.Label(top, text="Enc public key (PEM):", style="Card.TLabel").grid(
+            row=0, column=0, sticky="e", padx=(10, 4), pady=5)
+        ttk.Entry(top, textvariable=self._enc_pub_path, width=66).grid(
+            row=0, column=1, columnspan=2, sticky="we", padx=4)
+        ttk.Button(top, text="Browse", command=self._browse_enc_pub, width=8).grid(
+            row=0, column=3, padx=(4, 10))
 
-        self._status_var = tk.StringVar(value="Status: not connected")
-        ttk.Label(self.root, textvariable=self._status_var, foreground="#0a0").pack(fill=tk.X, padx=8)
+        ttk.Label(top, text="Sign public key (PEM):", style="Card.TLabel").grid(
+            row=1, column=0, sticky="e", padx=(10, 4), pady=5)
+        ttk.Entry(top, textvariable=self._sign_pub_path, width=66).grid(
+            row=1, column=1, columnspan=2, sticky="we", padx=4)
+        ttk.Button(top, text="Browse", command=self._browse_sign_pub, width=8).grid(
+            row=1, column=3, padx=(4, 10))
 
-        nb = ttk.Notebook(self.root)
-        nb.pack(fill=tk.BOTH, expand=True, **pad)
+        ttk.Label(top, text="Server IP:", style="Card.TLabel").grid(
+            row=2, column=0, sticky="e", padx=(10, 4), pady=5)
+        ttk.Entry(top, textvariable=self._ip_var, width=22).grid(
+            row=2, column=1, sticky="w", padx=4)
+        ttk.Label(top, text="Port:", style="Card.TLabel").grid(
+            row=2, column=2, sticky="e", padx=4)
+        ttk.Entry(top, textvariable=self._port_var, width=8).grid(
+            row=2, column=3, sticky="w", padx=(4, 10))
+
+        ttk.Button(top, text="Load Server Keys", command=self._on_load_keys).grid(
+            row=3, column=0, columnspan=4, sticky="we", padx=10, pady=(4, 10))
+        top.columnconfigure(1, weight=1)
+
+        # ── Enrollment + Login panels side by side ─────────────────────
+        actions = tk.Frame(body, bg=_C_BG)
+        actions.pack(fill=tk.X, pady=(0, 6))
+        actions.columnconfigure(0, weight=1)
+        actions.columnconfigure(1, weight=1)
+
+        enr = ttk.LabelFrame(actions, text="ENROLLMENT")
+        enr.grid(row=0, column=0, sticky="nswe", padx=(0, 4))
+        ttk.Label(enr, text="Username:", style="Card.TLabel").grid(
+            row=0, column=0, sticky="e", padx=(10, 4), pady=4)
+        ttk.Entry(enr, textvariable=self._reg_user, width=22).grid(
+            row=0, column=1, sticky="we", padx=(4, 10))
+        ttk.Label(enr, text="Password:", style="Card.TLabel").grid(
+            row=1, column=0, sticky="e", padx=(10, 4), pady=4)
+        ttk.Entry(enr, textvariable=self._reg_pass, width=22, show="*").grid(
+            row=1, column=1, sticky="we", padx=(4, 10))
+        ttk.Label(enr, text="Channel:", style="Card.TLabel").grid(
+            row=2, column=0, sticky="e", padx=(10, 4), pady=4)
+        ttk.Combobox(enr, textvariable=self._reg_channel,
+                     values=list(CHANNELS), state="readonly", width=20).grid(
+            row=2, column=1, sticky="w", padx=(4, 10))
+        ttk.Button(enr, text="Enroll", command=self._on_enroll).grid(
+            row=3, column=0, columnspan=2, sticky="we", padx=10, pady=(4, 10))
+        enr.columnconfigure(1, weight=1)
+
+        log_f = ttk.LabelFrame(actions, text="LOGIN")
+        log_f.grid(row=0, column=1, sticky="nswe", padx=(4, 0))
+        ttk.Label(log_f, text="Username:", style="Card.TLabel").grid(
+            row=0, column=0, sticky="e", padx=(10, 4), pady=4)
+        ttk.Entry(log_f, textvariable=self._login_user, width=22).grid(
+            row=0, column=1, sticky="we", padx=(4, 10))
+        ttk.Label(log_f, text="Password:", style="Card.TLabel").grid(
+            row=1, column=0, sticky="e", padx=(10, 4), pady=4)
+        ttk.Entry(log_f, textvariable=self._login_pass, width=22, show="*").grid(
+            row=1, column=1, sticky="we", padx=(4, 10))
+        btns = tk.Frame(log_f, bg=_C_BG2)
+        btns.grid(row=3, column=0, columnspan=2, sticky="we", padx=10, pady=(4, 10))
+        self._login_btn = ttk.Button(btns, text="Login", command=self._on_login)
+        self._login_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self._disconnect_btn = ttk.Button(btns, text="Disconnect",
+                                          command=self._on_disconnect, state=tk.DISABLED)
+        self._disconnect_btn.pack(side=tk.LEFT)
+        log_f.columnconfigure(1, weight=1)
+
+        # ── Notebook: channel chat + crypto log ────────────────────────
+        nb = ttk.Notebook(body)
+        nb.pack(fill=tk.BOTH, expand=True)
 
         ch_frame = ttk.Frame(nb)
-        self._ch_label = ttk.Label(ch_frame, text="Channel: (not authenticated)", font=("TkDefaultFont", 11, "bold"))
-        self._ch_label.pack(anchor="w", padx=6, pady=4)
+        ch_header = tk.Frame(ch_frame, bg=_C_BG3, height=36)
+        ch_header.pack(fill=tk.X)
+        ch_header.pack_propagate(False)
+        self._ch_label = tk.Label(
+            ch_header, text="Channel: (not authenticated)",
+            bg=_C_BG3, fg=_C_DARK,
+            font=(_C_FONT[0], 10, "bold"),
+        )
+        self._ch_label.pack(side=tk.LEFT, padx=10, pady=6)
 
-        msg_box = ttk.Frame(ch_frame)
-        msg_box.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
-        self._messages_widget = tk.Text(msg_box, wrap=tk.WORD, height=20, state=tk.DISABLED)
+        msg_box = ttk.Frame(ch_frame, style="Card.TFrame")
+        msg_box.pack(fill=tk.BOTH, expand=True, padx=6, pady=(4, 0))
+        self._messages_widget = tk.Text(
+            msg_box, wrap=tk.WORD, height=16, state=tk.DISABLED,
+            bg=_C_BG2, fg=_C_TEXT, relief="flat", borderwidth=0,
+            font=_C_FONT, padx=10, pady=8,
+        )
         scr = ttk.Scrollbar(msg_box, command=self._messages_widget.yview)
         self._messages_widget.configure(yscrollcommand=scr.set)
         self._messages_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scr.pack(side=tk.RIGHT, fill=tk.Y)
 
-        send_box = ttk.Frame(ch_frame)
-        send_box.pack(fill=tk.X, padx=4, pady=4)
+        send_box = tk.Frame(ch_frame, bg=_C_BG3)
+        send_box.pack(fill=tk.X, padx=6, pady=4)
         self._compose_var = tk.StringVar()
         self._compose_entry = ttk.Entry(send_box, textvariable=self._compose_var)
-        self._compose_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+        self._compose_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 4), pady=6)
         self._compose_entry.bind("<Return>", lambda _e: self._on_send())
-        self._send_btn = ttk.Button(send_box, text="Send", command=self._on_send, state=tk.DISABLED)
-        self._send_btn.pack(side=tk.LEFT, padx=4)
+        self._send_btn = ttk.Button(send_box, text="Send ▶", command=self._on_send, state=tk.DISABLED)
+        self._send_btn.pack(side=tk.LEFT, padx=(0, 6), pady=6)
 
-        nb.add(ch_frame, text="Channel")
+        nb.add(ch_frame, text="  Channel  ")
 
         log_frame = ttk.Frame(nb)
-        self._log_widget = tk.Text(log_frame, wrap=tk.WORD, height=20)
+        self._log_widget = tk.Text(
+            log_frame, wrap=tk.WORD, height=16,
+            bg=_C_BG2, fg=_C_DIM, relief="flat", borderwidth=0,
+            font=_C_MONO, padx=8, pady=6,
+        )
         scrl = ttk.Scrollbar(log_frame, command=self._log_widget.yview)
         self._log_widget.configure(yscrollcommand=scrl.set)
         self._log_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrl.pack(side=tk.RIGHT, fill=tk.Y)
-        nb.add(log_frame, text="Crypto Log")
+        nb.add(log_frame, text="  Crypto Log  ")
 
     def _browse_enc_pub(self):
         p = filedialog.askopenfilename(
@@ -666,7 +816,7 @@ class ClientGUI:
             return
 
         self._login_btn.configure(state=tk.DISABLED)
-        self._set_status(f"Status: authenticating as '{username}'...")
+        self._set_status(f"● Authenticating as '{username}'...", _C_ACCENT)
 
         def worker():
             result = self.core.login(ip, port, username, password)
@@ -737,7 +887,7 @@ class ClientGUI:
 
     def _handle_state(self, state: str, _info: dict):
         if state == "DISCONNECTED":
-            self._set_status("Status: not connected")
+            self._set_status("● Not connected", _C_WARN)
             self._send_btn.configure(state=tk.DISABLED)
             self._login_btn.configure(state=tk.NORMAL)
             self._disconnect_btn.configure(state=tk.DISABLED)
@@ -752,26 +902,27 @@ class ClientGUI:
             self._login_btn.configure(state=tk.DISABLED)
             ch_text = channel if channel else "(authenticated)"
             self._ch_label.configure(text=f"Channel: {ch_text}")
-            self._set_status(f"Status: connected as '{username}'")
+            self._set_status(f"● Connected as '{username}'  [{ch_text}]", _C_GREEN)
         elif result == "wrong_password":
             messagebox.showerror("Wrong password", "Decryption failed; the password is likely wrong.")
-            self._set_status("Status: not connected")
+            self._set_status("● Not connected", _C_WARN)
             self._login_btn.configure(state=tk.NORMAL)
         elif result == "auth_failed":
             messagebox.showerror("Authentication failed", "Server rejected the login.")
-            self._set_status("Status: not connected")
+            self._set_status("● Not connected", _C_WARN)
             self._login_btn.configure(state=tk.NORMAL)
         elif result == "channel_unavailable":
             messagebox.showwarning("Channel unavailable", "The channel keys have not been generated on the server yet.")
-            self._set_status("Status: not connected")
+            self._set_status("● Not connected", _C_WARN)
             self._login_btn.configure(state=tk.NORMAL)
         else:
             messagebox.showerror("Network error", "Could not reach server. See log.")
-            self._set_status("Status: not connected")
+            self._set_status("● Not connected", _C_WARN)
             self._login_btn.configure(state=tk.NORMAL)
 
-    def _set_status(self, s: str):
+    def _set_status(self, s: str, color: str = _C_WARN):
         self._status_var.set(s)
+        self._status_badge.configure(fg=color)
 
     def run(self):
         self.root.mainloop()
