@@ -1,7 +1,5 @@
-"""
-secure channel client — cs432 project
-enrollment, auth, broadcast recv/send + tkinter gui
-"""
+# CS432 / 532 Spring 2026
+# client side — enrollment, challenge-response login, secure broadcast
 
 import json
 import queue
@@ -12,921 +10,744 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from Crypto.Cipher import AES, PKCS1_OAEP
-from Crypto.Hash import SHA3_512, HMAC as PyHMAC
+from Crypto.Hash import SHA3_512, HMAC as CryptoHMAC
 from Crypto.PublicKey import RSA
 from Crypto.Signature import pkcs1_15
 from Crypto.Util.Padding import pad, unpad
 
 
-# --- constants ---
 CHANNELS = ("IF100", "MATH101", "SPS101")
 
-AES_BLOCK_SIZE = 16
-AES_KEY_LEN = 32
-HMAC_KEY_LEN = 32
-NONCE_LEN = 16
-
-AUTH_OK_TEXT = b"Authentication Successful"
-AUTH_FAIL_TEXT = b"Authentication Unsuccessful"
-AUTH_CHANNEL_UNAVAILABLE = b"Channel Unavailable"
-
-
-# --- crypto helpers ---
-def sha3_512(data: bytes) -> bytes:
-    h = SHA3_512.new()
-    h.update(data)
-    return h.digest()
-
-
-def reverse_str(s: str) -> str:
-    return s[::-1]
-
-
-def password_hashes(password: str):
-    """returns (h_pw, h_rev_pw) as 64-byte sha3-512 digests."""
-    h_pw = sha3_512(password.encode("utf-8"))
-    h_rev_pw = sha3_512(reverse_str(password).encode("utf-8"))
-    return h_pw, h_rev_pw
-
-
-def derive_aes_key_iv_from_hash(h: bytes):
-    """key = h[0:32], iv = h[32:48]. last 16 bytes are unused."""
-    if len(h) != 64:
-        raise ValueError("Expected a 64-byte hash for key/IV derivation")
-    return h[0:AES_KEY_LEN], h[AES_KEY_LEN:AES_KEY_LEN + AES_BLOCK_SIZE]
-
-
-def derive_hmac_key_from_hash(h: bytes) -> bytes:
-    """first 32 bytes of the hash become the hmac key."""
-    if len(h) != 64:
-        raise ValueError("Expected a 64-byte hash for HMAC key derivation")
-    return h[0:HMAC_KEY_LEN]
-
-
-def aes_encrypt(key: bytes, iv: bytes, plaintext: bytes) -> bytes:
-    cipher = AES.new(key, AES.MODE_CBC, iv)
-    return cipher.encrypt(pad(plaintext, AES_BLOCK_SIZE))
-
-
-def aes_decrypt(key: bytes, iv: bytes, ciphertext: bytes) -> bytes:
-    """raises ValueError on bad padding (wrong key/iv)."""
-    cipher = AES.new(key, AES.MODE_CBC, iv)
-    return unpad(cipher.decrypt(ciphertext), AES_BLOCK_SIZE)
-
-
-def hmac_sha3_512(key: bytes, data: bytes) -> bytes:
-    h = PyHMAC.new(key, digestmod=SHA3_512)
-    h.update(data)
-    return h.digest()
-
-
-def hmac_verify(key: bytes, data: bytes, mac: bytes) -> bool:
-    """constant-time hmac check."""
-    try:
-        h = PyHMAC.new(key, digestmod=SHA3_512)
-        h.update(data)
-        h.verify(mac)
-        return True
-    except (ValueError, TypeError):
-        return False
-
-
-def load_rsa_key_from_file(path: str):
-    with open(path, "rb") as f:
-        return RSA.import_key(f.read())
-
-
-def rsa_encrypt(pub_key, plaintext: bytes) -> bytes:
-    """oaep with sha3-512."""
-    cipher = PKCS1_OAEP.new(pub_key, hashAlgo=SHA3_512)
-    return cipher.encrypt(plaintext)
-
-
-def rsa_verify(pub_key, data: bytes, signature: bytes) -> bool:
-    try:
-        h = SHA3_512.new(data)
-        pkcs1_15.new(pub_key).verify(h, signature)
-        return True
-    except (ValueError, TypeError):
-        return False
-
-
-def _recv_exact(sock: socket.socket, n: int) -> bytes:
-    """read exactly n bytes or raise on eof."""
-    buf = bytearray()
-    while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
-            raise ConnectionError("socket closed before all bytes received")
-        buf.extend(chunk)
-    return bytes(buf)
-
-
-def send_msg(sock: socket.socket, obj: dict) -> None:
-    """send dict as length-prefixed utf-8 json."""
-    raw = json.dumps(obj, separators=(",", ":")).encode("utf-8")
-    sock.sendall(struct.pack(">I", len(raw)) + raw)
-
-
-def recv_msg(sock: socket.socket) -> dict:
-    """receive a length-prefixed json frame."""
-    length_prefix = _recv_exact(sock, 4)
-    (length,) = struct.unpack(">I", length_prefix)
-    if length == 0 or length > 16 * 1024 * 1024:
-        raise ValueError(f"unreasonable frame length: {length}")
-    raw = _recv_exact(sock, length)
-    return json.loads(raw.decode("utf-8"))
-
-
-def to_hex(b: bytes) -> str:
-    return b.hex().upper()
-
-
-def from_hex(h: str) -> bytes:
-    return bytes.fromhex(h)
-
-
-def short_hex(b: bytes, head: int = 16, tail: int = 8) -> str:
-    """truncated hex for log lines — keeps first/last few bytes."""
-    h = to_hex(b)
-    if len(b) <= head + tail:
-        return h
-    return f"{h[: head * 2]}...{h[-tail * 2:]} ({len(b)} bytes)"
-
-
-def encode_enrollment(username: str, h_pw: bytes, h_rev_pw: bytes, channel: str) -> bytes:
-    """tight binary format to fit under rsa-3072+oaep's 254-byte limit."""
-    if len(h_pw) != 64 or len(h_rev_pw) != 64:
-        raise ValueError("Password hashes must be 64 bytes (SHA3-512)")
-    u = username.encode("utf-8")
-    c = channel.encode("utf-8")
-    if not (1 <= len(u) <= 32):
-        raise ValueError("Username must be 1-32 UTF-8 bytes")
-    if not (1 <= len(c) <= 16):
-        raise ValueError("Channel name must be 1-16 UTF-8 bytes")
-    return bytes([len(u)]) + u + h_pw + h_rev_pw + bytes([len(c)]) + c
-
-
-# --- client core ---
-class SecureChannelClient:
-    """
-    holds state for one client session. gui calls in,
-    we report back via log_cb / state_cb / message_cb.
-    """
-
-    def __init__(self, log_cb, state_cb, message_cb):
-        self.log_cb = log_cb
-        self.state_cb = state_cb
-        self.message_cb = message_cb
-
-        # server pubkeys, loaded from pem files
-        self.server_enc_pub = None      # encrypt to server
-        self.server_sign_pub = None     # verify server sigs
-
-        # session state
-        self.sock = None
-        self.username = None
-        self.channel = None
-        self.session_aes_key = None
-        self.session_iv = None
-        self.session_hmac_key = None
-
-        self._recv_thread = None
-        self._connected = False
-
-    def load_server_pubkeys(self, enc_path: str, sign_path: str) -> None:
-        self.server_enc_pub = load_rsa_key_from_file(enc_path)
-        self.server_sign_pub = load_rsa_key_from_file(sign_path)
-        self.log_cb(f"Loaded server enc public key from: {enc_path}")
-        self.log_cb(f"  modulus n (hex): {to_hex(self.server_enc_pub.n.to_bytes(384, 'big'))}")
-        self.log_cb(f"  public  e (hex): {to_hex(self.server_enc_pub.e.to_bytes((self.server_enc_pub.e.bit_length() + 7) // 8, 'big'))}")
-        self.log_cb(f"Loaded server sign public key from: {sign_path}")
-        self.log_cb(f"  modulus n (hex): {to_hex(self.server_sign_pub.n.to_bytes(384, 'big'))}")
-        self.log_cb(f"  public  e (hex): {to_hex(self.server_sign_pub.e.to_bytes((self.server_sign_pub.e.bit_length() + 7) // 8, 'big'))}")
-
-    def enroll(self, ip: str, port: int, username: str, password: str, channel: str) -> bool:
-        """enroll the user. returns True if it worked."""
-        if self.server_enc_pub is None or self.server_sign_pub is None:
-            self.log_cb("ERROR: Server public keys not loaded.")
-            return False
-        if channel not in CHANNELS:
-            self.log_cb(f"ERROR: invalid channel: {channel}")
-            return False
-
-        h_pw, h_rev_pw = password_hashes(password)
-        self.log_cb(f"[Enrollment] SHA3-512(password):           {to_hex(h_pw)}")
-        self.log_cb(f"[Enrollment] SHA3-512(reversed password):  {to_hex(h_rev_pw)}")
-
-        payload = encode_enrollment(username, h_pw, h_rev_pw, channel)
-
-        ct = rsa_encrypt(self.server_enc_pub, payload)
-        self.log_cb(f"[Enrollment] RSA-OAEP encrypted payload: {short_hex(ct)}")
-
-        try:
-            sock = socket.create_connection((ip, port), timeout=10)
-        except OSError as e:
-            self.log_cb(f"[Enrollment] Connection failed: {e}")
-            return False
-
-        try:
-            send_msg(sock, {"type": "ENROLL_REQ", "payload_hex": to_hex(ct)})
-            resp = recv_msg(sock)
-        except (ConnectionError, OSError, ValueError) as e:
-            self.log_cb(f"[Enrollment] Network error: {e}")
-            try: sock.close()
-            except OSError: pass
-            return False
-        finally:
-            try: sock.close()
-            except OSError: pass
-
-        if resp.get("type") != "ENROLL_RESP":
-            self.log_cb(f"[Enrollment] Unexpected response: {resp}")
-            return False
-
-        message = resp.get("message", "")
-        sig = from_hex(resp.get("signature_hex", ""))
-        self.log_cb(f"[Enrollment] Server response: '{message}'")
-        self.log_cb(f"[Enrollment] Signature: {short_hex(sig)}")
-
-        if not rsa_verify(self.server_sign_pub, message.encode("utf-8"), sig):
-            self.log_cb("[Enrollment] SIGNATURE INVALID. Discarding response.")
-            return False
-        self.log_cb("[Enrollment] Server signature verified OK.")
-
-        if message.startswith("success"):
-            return True
-        return False
-
-    def login(self, ip: str, port: int, username: str, password: str) -> str:
-        """
-        challenge-response auth. returns "ok", "wrong_password",
-        "auth_failed", "channel_unavailable", or "network_error".
-        on "ok" the socket stays open and recv thread is started.
-        """
-        if self.server_enc_pub is None or self.server_sign_pub is None:
-            self.log_cb("ERROR: Server public keys not loaded.")
-            return "network_error"
-
-        try:
-            sock = socket.create_connection((ip, port), timeout=10)
-        except OSError as e:
-            self.log_cb(f"[Auth] Connection failed: {e}")
-            return "network_error"
-
-        try:
-            self.log_cb(f"[Auth] Sending AUTH_REQ for username '{username}'")
-            send_msg(sock, {"type": "AUTH_REQ", "username": username})
-
-            chal_msg = recv_msg(sock)
-            if chal_msg.get("type") != "AUTH_CHALLENGE":
-                self.log_cb(f"[Auth] Unexpected: {chal_msg}")
-                sock.close()
-                return "network_error"
-
-            challenge = from_hex(chal_msg["challenge_hex"])
-            self.log_cb(f"[Auth] Received 128-bit challenge: {to_hex(challenge)}")
-
-            h_pw, h_rev_pw = password_hashes(password)
-            hmac_key = derive_hmac_key_from_hash(h_pw)
-            mac = hmac_sha3_512(hmac_key, challenge)
-            self.log_cb(f"[Auth] HMAC key (lower half h(pw)): {to_hex(hmac_key)}")
-            self.log_cb(f"[Auth] Sending HMAC-SHA3-512:        {to_hex(mac)}")
-            send_msg(sock, {"type": "AUTH_HMAC", "hmac_hex": to_hex(mac)})
-
-            res = recv_msg(sock)
-            if res.get("type") != "AUTH_RESULT":
-                self.log_cb(f"[Auth] Unexpected result message: {res}")
-                sock.close()
-                return "network_error"
-
-            ct = from_hex(res["ciphertext_hex"])
-            sig = from_hex(res["signature_hex"])
-            self.log_cb(f"[Auth] Result ciphertext: {short_hex(ct)}")
-            self.log_cb(f"[Auth] Result signature:  {short_hex(sig)}")
-
-            if not rsa_verify(self.server_sign_pub, ct, sig):
-                self.log_cb("[Auth] SIGNATURE INVALID on AUTH_RESULT. Discarding.")
-                sock.close()
-                return "auth_failed"
-            self.log_cb("[Auth] Signature on result verified OK.")
-
-            ack_key, ack_iv = derive_aes_key_iv_from_hash(h_rev_pw)
-            self.log_cb(f"[Auth] AES key for ack decryption: {to_hex(ack_key)}")
-            self.log_cb(f"[Auth] IV  for ack decryption:    {to_hex(ack_iv)}")
-
-            try:
-                pt = aes_decrypt(ack_key, ack_iv, ct)
-            except ValueError:
-                self.log_cb("[Auth] AES decryption failed (likely wrong password).")
-                sock.close()
-                return "wrong_password"
-
-            self.log_cb(f"[Auth] Decrypted plaintext (first 64 bytes hex): {to_hex(pt[:64])}")
-
-            if pt.startswith(AUTH_OK_TEXT):
-                tail = pt[len(AUTH_OK_TEXT):]
-                fixed_len = AES_KEY_LEN + AES_BLOCK_SIZE + HMAC_KEY_LEN
-                if len(tail) < fixed_len:
-                    self.log_cb(f"[Auth] Unexpected tail length: {len(tail)} bytes.")
-                    sock.close()
-                    return "auth_failed"
-
-                aes_key = tail[: AES_KEY_LEN]
-                iv = tail[AES_KEY_LEN: AES_KEY_LEN + AES_BLOCK_SIZE]
-                hmac_key_ch = tail[AES_KEY_LEN + AES_BLOCK_SIZE: fixed_len]
-                channel_bytes = tail[fixed_len:]
-                try:
-                    channel_name = channel_bytes.decode("utf-8")
-                except UnicodeDecodeError:
-                    channel_name = ""
-
-                self.session_aes_key = aes_key
-                self.session_iv = iv
-                self.session_hmac_key = hmac_key_ch
-                self.username = username
-                self.channel = channel_name if channel_name in CHANNELS else None
-
-                self.log_cb("[Auth] Authentication Successful.")
-                self.log_cb(f"[Auth] Channel:          {channel_name}")
-                self.log_cb(f"[Auth] Channel AES key:  {to_hex(aes_key)}")
-                self.log_cb(f"[Auth] Channel IV:       {to_hex(iv)}")
-                self.log_cb(f"[Auth] Channel HMAC key: {to_hex(hmac_key_ch)}")
-
-                sock.settimeout(None)
-                self.sock = sock
-                self._connected = True
-                self._recv_thread = threading.Thread(target=self._receive_loop, daemon=True)
-                self._recv_thread.start()
-                return "ok"
-
-            if pt == AUTH_FAIL_TEXT:
-                self.log_cb("[Auth] Server reported: Authentication Unsuccessful.")
-                sock.close()
-                return "auth_failed"
-
-            if pt == AUTH_CHANNEL_UNAVAILABLE:
-                self.log_cb("[Auth] Server reported: Channel Unavailable.")
-                sock.close()
-                return "channel_unavailable"
-
-            self.log_cb(f"[Auth] Unexpected plaintext: {pt!r}")
-            sock.close()
-            return "auth_failed"
-
-        except (ConnectionError, OSError, ValueError) as e:
-            self.log_cb(f"[Auth] Network error: {e}")
-            try: sock.close()
-            except OSError: pass
-            return "network_error"
-
-    def set_channel(self, channel: str):
-        """gui calls this after login to set which channel we're on."""
-        self.channel = channel
-
-    def send_broadcast(self, message: str) -> bool:
-        if not self._connected or self.session_aes_key is None:
-            self.log_cb("Cannot send: not authenticated.")
-            return False
-        try:
-            ct = aes_encrypt(self.session_aes_key, self.session_iv, message.encode("utf-8"))
-            mac = hmac_sha3_512(self.session_hmac_key, ct)
-            self.log_cb(f"[Send] AES-CBC ciphertext: {short_hex(ct)}")
-            self.log_cb(f"[Send] HMAC:               {short_hex(mac)}")
-            send_msg(
-                self.sock,
-                {
-                    "type": "BROADCAST",
-                    "ciphertext_hex": to_hex(ct),
-                    "hmac_hex": to_hex(mac),
-                },
-            )
-            return True
-        except (OSError, ConnectionError) as e:
-            self.log_cb(f"[Send] Network error: {e}")
-            self._mark_disconnected()
-            return False
-
-    def _receive_loop(self) -> None:
-        while self._connected:
-            try:
-                msg = recv_msg(self.sock)
-            except (ConnectionError, OSError, ValueError):
-                self._mark_disconnected()
-                return
-            if msg.get("type") != "BROADCAST":
-                self.log_cb(f"[Recv] Unexpected type: {msg.get('type')}")
-                continue
-
-            sender = msg.get("from", "?")
-            ct = from_hex(msg.get("ciphertext_hex", ""))
-            mac = from_hex(msg.get("hmac_hex", ""))
-
-            self.log_cb(f"[Recv] from '{sender}': ct={short_hex(ct)} hmac={short_hex(mac)}")
-
-            if not hmac_verify(self.session_hmac_key, ct, mac):
-                self.log_cb(f"[Recv] HMAC INVALID for message from '{sender}'. Discarded.")
-                self.message_cb(sender, "<<INVALID HMAC — message discarded>>")
-                continue
-            try:
-                pt = aes_decrypt(self.session_aes_key, self.session_iv, ct)
-            except ValueError:
-                self.log_cb(f"[Recv] Decryption failed for message from '{sender}'.")
-                self.message_cb(sender, "<<DECRYPTION FAILED — message discarded>>")
-                continue
-
-            try:
-                text = pt.decode("utf-8")
-            except UnicodeDecodeError:
-                text = repr(pt)
-
-            self.log_cb(f"[Recv] Plaintext from '{sender}': {text}")
-            self.message_cb(sender, text)
-
-    def _mark_disconnected(self):
-        if not self._connected:
-            return
-        self._connected = False
-        try:
-            if self.sock is not None:
-                self.sock.close()
-        except OSError:
-            pass
-        self.sock = None
-        self.session_aes_key = None
-        self.session_iv = None
-        self.session_hmac_key = None
-        self.username = None
-        self.channel = None
-        self.state_cb("DISCONNECTED", {})
-        self.log_cb("Disconnected from server.")
-
-    def disconnect(self) -> None:
-        if self._connected and self.sock is not None:
-            try:
-                send_msg(self.sock, {"type": "DISCONNECT"})
-            except (OSError, ConnectionError):
-                pass
-        self._mark_disconnected()
-
-
-# --- gui ---
-
-# light / sky-blue palette
-_C_BG     = "#f0f7ff"
-_C_BG2    = "#ffffff"
-_C_BG3    = "#dbeafe"
-_C_ACCENT = "#0ea5e9"
-_C_ACCT2  = "#38bdf8"
-_C_DARK   = "#0369a1"
-_C_TEXT   = "#0f172a"
-_C_DIM    = "#64748b"
-_C_GREEN  = "#059669"
-_C_WARN   = "#dc2626"
-_C_FONT   = ("Segoe UI", 10) if tk.TkVersion else ("TkDefaultFont", 10)
-_C_MONO   = ("Consolas", 10) if tk.TkVersion else ("Courier", 10)
-
-
-def _client_style(root):
+# GUI palette — light blue/slate
+C_BG   = "#f0f7ff"
+C_CARD = "#ffffff"
+C_BAND = "#dbeafe"
+C_ACC  = "#0ea5e9"
+C_DARK = "#0369a1"
+C_INK  = "#0f172a"
+C_SUB  = "#64748b"
+C_OK   = "#059669"
+C_ERR  = "#dc2626"
+FONT   = ("Segoe UI", 10)
+MONO   = ("Consolas", 10)
+
+
+def _theme(root):
     s = ttk.Style(root)
     s.theme_use("clam")
-    s.configure(".",
-        background=_C_BG, foreground=_C_TEXT,
-        troughcolor=_C_BG3, bordercolor=_C_BG3,
-        darkcolor=_C_BG3, lightcolor=_C_BG2,
-        selectbackground=_C_ACCENT, selectforeground=_C_BG2,
-    )
-    s.configure("TFrame",       background=_C_BG)
-    s.configure("Card.TFrame",  background=_C_BG2)
-    s.configure("TLabel",       background=_C_BG,  foreground=_C_TEXT)
-    s.configure("Card.TLabel",  background=_C_BG2, foreground=_C_TEXT)
-    s.configure("Dim.TLabel",   background=_C_BG2, foreground=_C_DIM)
+    s.configure(".", background=C_BG, foreground=C_INK,
+                 troughcolor=C_BAND, bordercolor=C_BAND,
+                 darkcolor=C_BAND, lightcolor=C_CARD,
+                 selectbackground=C_ACC, selectforeground=C_CARD)
+    s.configure("TFrame",        background=C_BG)
+    s.configure("Card.TFrame",   background=C_CARD)
+    s.configure("TLabel",        background=C_BG,   foreground=C_INK)
+    s.configure("Card.TLabel",   background=C_CARD, foreground=C_INK)
     s.configure("TLabelframe",
-        background=_C_BG2, foreground=_C_DARK,
-        bordercolor=_C_BG3, relief="groove",
-    )
+                background=C_CARD, foreground=C_DARK,
+                bordercolor=C_BAND, relief="groove")
     s.configure("TLabelframe.Label",
-        background=_C_BG2, foreground=_C_DARK,
-        font=(_C_FONT[0], 9, "bold"),
-    )
+                background=C_CARD, foreground=C_DARK,
+                font=(FONT[0], 9, "bold"))
     s.configure("TButton",
-        background=_C_ACCENT, foreground=_C_BG2,
-        borderwidth=0, relief="flat", padding=(10, 5),
-        font=(_C_FONT[0], 9, "bold"),
-    )
+                background=C_ACC, foreground=C_CARD,
+                borderwidth=0, relief="flat", padding=(10, 5),
+                font=(FONT[0], 9, "bold"))
     s.map("TButton",
-        background=[("active", _C_DARK), ("disabled", _C_BG3)],
-        foreground=[("disabled", _C_DIM)],
-    )
+          background=[("active", C_DARK), ("disabled", C_BAND)],
+          foreground=[("disabled", C_SUB)])
     s.configure("TEntry",
-        fieldbackground=_C_BG2, foreground=_C_TEXT,
-        bordercolor=_C_BG3, insertcolor=_C_TEXT,
-    )
+                fieldbackground=C_CARD, foreground=C_INK,
+                bordercolor=C_BAND, insertcolor=C_INK)
     s.configure("TCombobox",
-        fieldbackground=_C_BG2, foreground=_C_TEXT,
-        selectbackground=_C_ACCENT, selectforeground=_C_BG2,
-        arrowcolor=_C_ACCENT, bordercolor=_C_BG3,
-    )
-    s.map("TCombobox",
-        fieldbackground=[("readonly", _C_BG2)],
-        selectbackground=[("readonly", _C_ACCENT)],
-    )
+                fieldbackground=C_CARD, foreground=C_INK,
+                selectbackground=C_ACC, arrowcolor=C_ACC, bordercolor=C_BAND)
+    s.map("TCombobox", fieldbackground=[("readonly", C_CARD)])
     s.configure("TNotebook",
-        background=_C_BG, bordercolor=_C_BG3, tabmargins=[2, 4, 2, 0],
-    )
+                background=C_BG, bordercolor=C_BAND, tabmargins=[2, 4, 2, 0])
     s.configure("TNotebook.Tab",
-        background=_C_BG3, foreground=_C_DIM,
-        padding=[14, 6], borderwidth=0,
-        font=(_C_FONT[0], 9, "bold"),
-    )
+                background=C_BAND, foreground=C_SUB,
+                padding=[14, 6], font=(FONT[0], 9, "bold"))
     s.map("TNotebook.Tab",
-        background=[("selected", _C_ACCENT)],
-        foreground=[("selected", _C_BG2)],
-        expand=[("selected", [1, 1, 1, 0])],
-    )
+          background=[("selected", C_ACC)],
+          foreground=[("selected", C_CARD)],
+          expand=[("selected", [1, 1, 1, 0])])
     s.configure("Vertical.TScrollbar",
-        background=_C_BG3, troughcolor=_C_BG,
-        bordercolor=_C_BG, arrowcolor=_C_DIM,
-        relief="flat",
-    )
+                background=C_BAND, troughcolor=C_BG,
+                bordercolor=C_BG, arrowcolor=C_SUB, relief="flat")
 
 
-class ClientGUI:
+# single class handles everything — gui, session state, network, crypto.
+# background threads push events into self._eq; _tick() drains it every 40ms
+class SecureClient:
+
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("CS432 — Secure Channel CLIENT")
-        self.root.geometry("1080x860")
-        self.root.configure(bg=_C_BG)
-        _client_style(self.root)
+        self.root.title("CS432 — CLIENT")
+        self.root.geometry("1100x860")
+        self.root.configure(bg=C_BG)
+        _theme(self.root)
 
-        self._gui_q = queue.Queue()
-        self.root.after(50, self._poll_gui_queue)
+        # session state — a single dict when logged in, None when not
+        # keys: "aes", "iv", "mac", "ch", "user"
+        self._sess  = None
+        self._conn  = None   # socket (kept open during broadcast phase)
+        self._alive = False  # True while receiver thread is running
 
-        self._enc_pub_path = tk.StringVar()
-        self._sign_pub_path = tk.StringVar()
-        self._ip_var = tk.StringVar(value="127.0.0.1")
-        self._port_var = tk.StringVar(value="6000")
+        # server RSA public keys, loaded from PEM files before use
+        self._pub_enc = None
+        self._pub_sig = None
 
-        self._reg_user = tk.StringVar()
-        self._reg_pass = tk.StringVar()
-        self._reg_channel = tk.StringVar(value=CHANNELS[0])
+        # thread → main loop event queue
+        # events are tuples: (kind, *args)
+        self._eq = queue.Queue()
+        self.root.after(40, self._tick)
 
-        self._login_user = tk.StringVar()
-        self._login_pass = tk.StringVar()
+        # tkinter form variables
+        self._v_enc   = tk.StringVar()
+        self._v_sig   = tk.StringVar()
+        self._v_ip    = tk.StringVar(value="127.0.0.1")
+        self._v_port  = tk.StringVar(value="6000")
+        self._v_ruser = tk.StringVar()
+        self._v_rpass = tk.StringVar()
+        self._v_rchan = tk.StringVar(value=CHANNELS[0])
+        self._v_luser = tk.StringVar()
+        self._v_lpass = tk.StringVar()
+        self._v_stat  = tk.StringVar(value="● Not connected")
+        self._v_chanl = tk.StringVar(value="—")
 
-        self.core = SecureChannelClient(
-            log_cb=self._log_threadsafe,
-            state_cb=self._state_threadsafe,
-            message_cb=self._msg_threadsafe,
-        )
+        self._build()
+        self.root.protocol("WM_DELETE_WINDOW", self._quit)
 
-        self._build_ui()
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+    # network I/O — 4-byte big-endian length prefix + JSON body
 
-    def _build_ui(self):
-        # ── Header banner ──────────────────────────────────────────────
-        banner = tk.Frame(self.root, bg=_C_ACCENT, height=58)
-        banner.pack(fill=tk.X)
-        banner.pack_propagate(False)
-        tk.Label(
-            banner, text="  CLIENT",
-            bg=_C_ACCENT, fg=_C_BG2,
-            font=(_C_FONT[0], 17, "bold"),
-        ).pack(side=tk.LEFT, padx=18)
-        tk.Label(
-            banner, text="CS432 Secure Channel",
-            bg=_C_ACCENT, fg=_C_BG,
-            font=(_C_FONT[0], 10),
-        ).pack(side=tk.LEFT, padx=4)
-        self._status_var = tk.StringVar(value="● Not connected")
-        self._status_badge = tk.Label(
-            banner, textvariable=self._status_var,
-            bg=_C_BG2, fg=_C_WARN,
-            font=(_C_FONT[0], 9, "bold"),
-            padx=10, pady=4,
-        )
-        self._status_badge.pack(side=tk.RIGHT, padx=18, pady=10)
+    def _readall(self, sock, n):
+        # pull exactly n bytes, blocking until we have them
+        buf = b""
+        while len(buf) < n:
+            got = sock.recv(n - len(buf))
+            if not got:
+                raise ConnectionError("server closed the connection")
+            buf += got
+        return buf
 
-        body = tk.Frame(self.root, bg=_C_BG)
-        body.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
+    def _net_recv(self, sock):
+        size = struct.unpack(">I", self._readall(sock, 4))[0]
+        if size == 0 or size > 16 * 1024 * 1024:
+            raise ValueError(f"frame size {size} looks wrong")
+        return json.loads(self._readall(sock, size).decode("utf-8"))
 
-        # ── Server keys & connection ───────────────────────────────────
-        top = ttk.LabelFrame(body, text="SERVER KEYS & CONNECTION")
-        top.pack(fill=tk.X, pady=(0, 6))
+    def _net_send(self, sock, data):
+        raw = json.dumps(data, separators=(",", ":")).encode("utf-8")
+        sock.sendall(struct.pack(">I", len(raw)) + raw)
 
-        ttk.Label(top, text="Enc public key (PEM):", style="Card.TLabel").grid(
-            row=0, column=0, sticky="e", padx=(10, 4), pady=5)
-        ttk.Entry(top, textvariable=self._enc_pub_path, width=66).grid(
-            row=0, column=1, columnspan=2, sticky="we", padx=4)
-        ttk.Button(top, text="Browse", command=self._browse_enc_pub, width=8).grid(
-            row=0, column=3, padx=(4, 10))
+    # key loading — called from main thread so it can write to the log widget directly
 
-        ttk.Label(top, text="Sign public key (PEM):", style="Card.TLabel").grid(
-            row=1, column=0, sticky="e", padx=(10, 4), pady=5)
-        ttk.Entry(top, textvariable=self._sign_pub_path, width=66).grid(
-            row=1, column=1, columnspan=2, sticky="we", padx=4)
-        ttk.Button(top, text="Browse", command=self._browse_sign_pub, width=8).grid(
-            row=1, column=3, padx=(4, 10))
+    def _load_keys(self, enc_path, sig_path):
+        self._pub_enc = RSA.import_key(open(enc_path, "rb").read())
+        self._pub_sig = RSA.import_key(open(sig_path, "rb").read())
 
-        ttk.Label(top, text="Server IP:", style="Card.TLabel").grid(
-            row=2, column=0, sticky="e", padx=(10, 4), pady=5)
-        ttk.Entry(top, textvariable=self._ip_var, width=22).grid(
-            row=2, column=1, sticky="w", padx=4)
-        ttk.Label(top, text="Port:", style="Card.TLabel").grid(
-            row=2, column=2, sticky="e", padx=4)
-        ttk.Entry(top, textvariable=self._port_var, width=8).grid(
-            row=2, column=3, sticky="w", padx=(4, 10))
+        for label, k, path in (("enc", self._pub_enc, enc_path),
+                                ("sig", self._pub_sig, sig_path)):
+            self._write_log(f"{label} public key: {path}")
+            nb = k.n.to_bytes(384, "big")
+            eb = k.e.to_bytes((k.e.bit_length() + 7) // 8, "big")
+            self._write_log(f"  n = {nb.hex().upper()}")
+            self._write_log(f"  e = {eb.hex().upper()}")
 
-        ttk.Button(top, text="Load Server Keys", command=self._on_load_keys).grid(
-            row=3, column=0, columnspan=4, sticky="we", padx=10, pady=(4, 10))
-        top.columnconfigure(1, weight=1)
+    # enrollment
 
-        # ── Enrollment + Login panels side by side ─────────────────────
-        actions = tk.Frame(body, bg=_C_BG)
-        actions.pack(fill=tk.X, pady=(0, 6))
-        actions.columnconfigure(0, weight=1)
-        actions.columnconfigure(1, weight=1)
+    def _enroll_worker(self, ip, port, user, pw, ch):
+        # compute hashes; we send H(pw) and H(reversed pw), never the plaintext
+        pw_hash  = SHA3_512.new(pw.encode()).digest()
+        rpw_hash = SHA3_512.new(pw[::-1].encode()).digest()
+        self._log(f"[enroll] H(pw)  = {pw_hash.hex().upper()}")
+        self._log(f"[enroll] H(rpw) = {rpw_hash.hex().upper()}")
 
-        enr = ttk.LabelFrame(actions, text="ENROLLMENT")
-        enr.grid(row=0, column=0, sticky="nswe", padx=(0, 4))
-        ttk.Label(enr, text="Username:", style="Card.TLabel").grid(
-            row=0, column=0, sticky="e", padx=(10, 4), pady=4)
-        ttk.Entry(enr, textvariable=self._reg_user, width=22).grid(
-            row=0, column=1, sticky="we", padx=(4, 10))
-        ttk.Label(enr, text="Password:", style="Card.TLabel").grid(
-            row=1, column=0, sticky="e", padx=(10, 4), pady=4)
-        ttk.Entry(enr, textvariable=self._reg_pass, width=22, show="*").grid(
-            row=1, column=1, sticky="we", padx=(4, 10))
-        ttk.Label(enr, text="Channel:", style="Card.TLabel").grid(
-            row=2, column=0, sticky="e", padx=(10, 4), pady=4)
-        ttk.Combobox(enr, textvariable=self._reg_channel,
-                     values=list(CHANNELS), state="readonly", width=20).grid(
-            row=2, column=1, sticky="w", padx=(4, 10))
-        ttk.Button(enr, text="Enroll", command=self._on_enroll).grid(
-            row=3, column=0, columnspan=2, sticky="we", padx=10, pady=(4, 10))
-        enr.columnconfigure(1, weight=1)
+        # binary payload — hashes first, then length-prefixed strings
+        # [64B H(pw)][64B H(rpw)][1B ulen][username][1B clen][channel]
+        # this order keeps it within RSA-3072 OAEP + SHA3-512's ~254B limit
+        ub = user.encode("utf-8")
+        cb = ch.encode("utf-8")
+        if not 1 <= len(ub) <= 32:
+            self._log("[enroll] ERROR: username must be 1-32 bytes")
+            self._eq.put(("enroll_done", False))
+            return
+        payload = pw_hash + rpw_hash + bytes([len(ub)]) + ub + bytes([len(cb)]) + cb
 
-        log_f = ttk.LabelFrame(actions, text="LOGIN")
-        log_f.grid(row=0, column=1, sticky="nswe", padx=(4, 0))
-        ttk.Label(log_f, text="Username:", style="Card.TLabel").grid(
-            row=0, column=0, sticky="e", padx=(10, 4), pady=4)
-        ttk.Entry(log_f, textvariable=self._login_user, width=22).grid(
-            row=0, column=1, sticky="we", padx=(4, 10))
-        ttk.Label(log_f, text="Password:", style="Card.TLabel").grid(
-            row=1, column=0, sticky="e", padx=(10, 4), pady=4)
-        ttk.Entry(log_f, textvariable=self._login_pass, width=22, show="*").grid(
-            row=1, column=1, sticky="we", padx=(4, 10))
-        btns = tk.Frame(log_f, bg=_C_BG2)
-        btns.grid(row=3, column=0, columnspan=2, sticky="we", padx=10, pady=(4, 10))
-        self._login_btn = ttk.Button(btns, text="Login", command=self._on_login)
-        self._login_btn.pack(side=tk.LEFT, padx=(0, 6))
-        self._disconnect_btn = ttk.Button(btns, text="Disconnect",
-                                          command=self._on_disconnect, state=tk.DISABLED)
-        self._disconnect_btn.pack(side=tk.LEFT)
-        log_f.columnconfigure(1, weight=1)
+        try:
+            ct = PKCS1_OAEP.new(self._pub_enc, hashAlgo=SHA3_512).encrypt(payload)
+        except ValueError as ex:
+            self._log(f"[enroll] RSA encrypt failed: {ex}")
+            self._eq.put(("enroll_done", False))
+            return
 
-        # ── Notebook: channel chat + crypto log ────────────────────────
-        nb = ttk.Notebook(body)
-        nb.pack(fill=tk.BOTH, expand=True)
+        self._log(f"[enroll] RSA-OAEP ciphertext = {ct.hex().upper()[:64]}...")
 
-        ch_frame = ttk.Frame(nb)
-        ch_header = tk.Frame(ch_frame, bg=_C_BG3, height=36)
-        ch_header.pack(fill=tk.X)
-        ch_header.pack_propagate(False)
-        self._ch_label = tk.Label(
-            ch_header, text="Channel: (not authenticated)",
-            bg=_C_BG3, fg=_C_DARK,
-            font=(_C_FONT[0], 10, "bold"),
-        )
-        self._ch_label.pack(side=tk.LEFT, padx=10, pady=6)
+        try:
+            sock = socket.create_connection((ip, port), timeout=10)
+        except OSError as ex:
+            self._log(f"[enroll] can't connect to {ip}:{port}: {ex}")
+            self._eq.put(("enroll_done", False))
+            return
 
-        msg_box = ttk.Frame(ch_frame, style="Card.TFrame")
-        msg_box.pack(fill=tk.BOTH, expand=True, padx=6, pady=(4, 0))
-        self._messages_widget = tk.Text(
-            msg_box, wrap=tk.WORD, height=16, state=tk.DISABLED,
-            bg=_C_BG2, fg=_C_TEXT, relief="flat", borderwidth=0,
-            font=_C_FONT, padx=10, pady=8,
-        )
-        scr = ttk.Scrollbar(msg_box, command=self._messages_widget.yview)
-        self._messages_widget.configure(yscrollcommand=scr.set)
-        self._messages_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scr.pack(side=tk.RIGHT, fill=tk.Y)
+        try:
+            self._net_send(sock, {"type": "REGISTER", "enc_hex": ct.hex().upper()})
+            resp = self._net_recv(sock)
+        except Exception as ex:
+            self._log(f"[enroll] network error: {ex}")
+            self._eq.put(("enroll_done", False))
+            return
+        finally:
+            try: sock.close()
+            except: pass
 
-        send_box = tk.Frame(ch_frame, bg=_C_BG3)
-        send_box.pack(fill=tk.X, padx=6, pady=4)
-        self._compose_var = tk.StringVar()
-        self._compose_entry = ttk.Entry(send_box, textvariable=self._compose_var)
-        self._compose_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 4), pady=6)
-        self._compose_entry.bind("<Return>", lambda _e: self._on_send())
-        self._send_btn = ttk.Button(send_box, text="Send ▶", command=self._on_send, state=tk.DISABLED)
-        self._send_btn.pack(side=tk.LEFT, padx=(0, 6), pady=6)
+        if resp.get("type") != "REG_RESULT":
+            self._log(f"[enroll] unexpected response: {resp.get('type')}")
+            self._eq.put(("enroll_done", False))
+            return
 
-        nb.add(ch_frame, text="  Channel  ")
+        msg = resp.get("text", "")
+        sig = bytes.fromhex(resp.get("sig_hex", ""))
+        self._log(f"[enroll] server says: '{msg}'")
+        self._log(f"[enroll] signature (first 32B): {sig.hex().upper()[:64]}...")
 
-        log_frame = ttk.Frame(nb)
-        self._log_widget = tk.Text(
-            log_frame, wrap=tk.WORD, height=16,
-            bg=_C_BG2, fg=_C_DIM, relief="flat", borderwidth=0,
-            font=_C_MONO, padx=8, pady=6,
-        )
-        scrl = ttk.Scrollbar(log_frame, command=self._log_widget.yview)
-        self._log_widget.configure(yscrollcommand=scrl.set)
-        self._log_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrl.pack(side=tk.RIGHT, fill=tk.Y)
-        nb.add(log_frame, text="  Crypto Log  ")
+        # always check the signature before trusting the response
+        try:
+            pkcs1_15.new(self._pub_sig).verify(SHA3_512.new(msg.encode("utf-8")), sig)
+            self._log("[enroll] signature OK")
+        except Exception:
+            self._log("[enroll] SIGNATURE INVALID — discarding response")
+            self._eq.put(("enroll_done", False))
+            return
 
-    def _browse_enc_pub(self):
-        p = filedialog.askopenfilename(
-            title="Select server enc PUBLIC key (PEM)",
-            filetypes=[("PEM files", "*.pem"), ("All files", "*.*")],
-        )
-        if p: self._enc_pub_path.set(p)
+        self._eq.put(("enroll_done", msg.startswith("success"), user, ch))
 
-    def _browse_sign_pub(self):
-        p = filedialog.askopenfilename(
-            title="Select server sign PUBLIC key (PEM)",
-            filetypes=[("PEM files", "*.pem"), ("All files", "*.*")],
-        )
-        if p: self._sign_pub_path.set(p)
+    # login — challenge-response, then stays open for broadcast
 
-    def _on_load_keys(self):
-        if not self._enc_pub_path.get() or not self._sign_pub_path.get():
-            messagebox.showerror("Missing keys", "Please choose both server public key files.")
+    def _login_worker(self, ip, port, user, pw):
+        # hash both pw and reversed pw upfront — used in HMAC and ack decryption
+        pw_hash  = SHA3_512.new(pw.encode()).digest()
+        rpw_hash = SHA3_512.new(pw[::-1].encode()).digest()
+
+        try:
+            sock = socket.create_connection((ip, port), timeout=10)
+        except OSError as ex:
+            self._log(f"[auth] connect failed: {ex}")
+            self._eq.put(("login_done", "network_error"))
+            return
+
+        try:
+            self._log(f"[auth] LOGIN → '{user}'")
+            self._net_send(sock, {"type": "LOGIN", "user": user})
+
+            # server responds with a random 128-bit nonce
+            chal_msg = self._net_recv(sock)
+            if chal_msg.get("type") != "CHALLENGE":
+                self._log(f"[auth] expected CHALLENGE, got {chal_msg.get('type')!r}")
+                sock.close(); self._eq.put(("login_done", "network_error")); return
+
+            nonce = bytes.fromhex(chal_msg["nonce_hex"])
+            self._log(f"[auth] challenge nonce = {nonce.hex().upper()}")
+
+            # HMAC key = first 32B of H(pw) — server derives the same from the stored hash
+            hmac_k = pw_hash[:32]
+            tag    = CryptoHMAC.new(hmac_k, digestmod=SHA3_512)
+            tag.update(nonce)
+            response = tag.digest()
+            self._log(f"[auth] HMAC key      = {hmac_k.hex().upper()}")
+            self._log(f"[auth] HMAC response = {response.hex().upper()}")
+            self._net_send(sock, {"type": "HMAC_RESP", "mac_hex": response.hex().upper()})
+
+            # server sends back an AES-encrypted, RSA-signed result
+            result = self._net_recv(sock)
+            if result.get("type") != "LOGIN_RESULT":
+                self._log(f"[auth] expected LOGIN_RESULT, got {result.get('type')!r}")
+                sock.close(); self._eq.put(("login_done", "network_error")); return
+
+            ct  = bytes.fromhex(result["ct_hex"])
+            sig = bytes.fromhex(result["sig_hex"])
+            self._log(f"[auth] result ct  = {ct.hex().upper()[:48]}...")
+            self._log(f"[auth] result sig = {sig.hex().upper()[:48]}...")
+
+            # always verify sig before decrypting
+            try:
+                pkcs1_15.new(self._pub_sig).verify(SHA3_512.new(ct), sig)
+                self._log("[auth] signature verified OK")
+            except Exception:
+                self._log("[auth] SIGNATURE FAILED — rejecting")
+                sock.close(); self._eq.put(("login_done", "auth_failed")); return
+
+            # ack is encrypted with key/IV from H(reversed password)
+            wrap_k  = rpw_hash[:32]
+            wrap_iv = rpw_hash[32:48]
+            self._log(f"[auth] ack wrap key = {wrap_k.hex().upper()}")
+            self._log(f"[auth] ack wrap IV  = {wrap_iv.hex().upper()}")
+
+            try:
+                pt = unpad(AES.new(wrap_k, AES.MODE_CBC, wrap_iv).decrypt(ct), 16)
+            except ValueError:
+                # padding error = wrong key = wrong password
+                self._log("[auth] AES decryption failed — wrong password?")
+                sock.close(); self._eq.put(("login_done", "wrong_password")); return
+
+            self._log(f"[auth] decrypted starts: {pt[:32].hex().upper()}...")
+
+        except (ConnectionError, OSError, ValueError) as ex:
+            self._log(f"[auth] protocol error: {ex}")
+            try: sock.close()
+            except: pass
+            self._eq.put(("login_done", "network_error"))
+            return
+
+        # check which result the server sent
+        if pt.startswith(b"Authentication Successful"):
+            rest = pt[len(b"Authentication Successful"):]
+
+            # server payload: 1B(ch_len) + ch_name + aes_key(32) + iv(16) + hmac_key(32)
+            if len(rest) < 2:
+                self._log("[auth] success payload too short")
+                sock.close(); self._eq.put(("login_done", "auth_failed")); return
+
+            clen    = rest[0]
+            ch_name = rest[1:1 + clen].decode("utf-8", errors="replace")
+            off     = 1 + clen
+
+            if len(rest) < off + 80:
+                self._log(f"[auth] key block too short ({len(rest) - off}B)")
+                sock.close(); self._eq.put(("login_done", "auth_failed")); return
+
+            aes_k  = rest[off:off + 32]
+            aes_iv = rest[off + 32:off + 48]
+            mac_k  = rest[off + 48:off + 80]
+
+            self._log(f"[auth] ✓ channel = {ch_name}")
+            self._log(f"[auth] AES key   = {aes_k.hex().upper()}")
+            self._log(f"[auth] AES IV    = {aes_iv.hex().upper()}")
+            self._log(f"[auth] HMAC key  = {mac_k.hex().upper()}")
+
+            self._sess = {
+                "aes":  aes_k,
+                "iv":   aes_iv,
+                "mac":  mac_k,
+                "ch":   ch_name if ch_name in CHANNELS else None,
+                "user": user
+            }
+
+            sock.settimeout(None)
+            self._conn  = sock
+            self._alive = True
+            threading.Thread(target=self._listener, daemon=True).start()
+
+            self._eq.put(("login_done", "ok"))
+            return
+
+        if pt == b"Authentication Unsuccessful":
+            self._log("[auth] server: Authentication Unsuccessful")
+            sock.close(); self._eq.put(("login_done", "auth_failed")); return
+
+        if pt == b"Channel Unavailable":
+            self._log("[auth] server: Channel Unavailable")
+            sock.close(); self._eq.put(("login_done", "channel_unavailable")); return
+
+        self._log(f"[auth] unrecognised plaintext: {pt[:40]!r}")
+        sock.close()
+        self._eq.put(("login_done", "auth_failed"))
+
+    # broadcast — send and receive
+
+    def _send_msg(self):
+        text = self._compose.get().strip()
+        if not text:
+            return
+        if not self._alive or not self._sess:
+            self._log("can't send — not logged in")
+            return
+
+        try:
+            ct = AES.new(
+                self._sess["aes"], AES.MODE_CBC, self._sess["iv"]
+            ).encrypt(pad(text.encode("utf-8"), 16))
+
+            tag_obj = CryptoHMAC.new(self._sess["mac"], digestmod=SHA3_512)
+            tag_obj.update(ct)
+            tag = tag_obj.digest()
+
+            self._log(f"[send] ct  = {ct.hex().upper()[:48]}...")
+            self._log(f"[send] mac = {tag.hex().upper()}")
+
+            self._net_send(self._conn, {
+                "type":    "MSG",
+                "ct_hex":  ct.hex().upper(),
+                "mac_hex": tag.hex().upper()
+            })
+            self._compose.set("")
+        except (OSError, ConnectionError) as ex:
+            self._log(f"[send] failed: {ex}")
+            self._shutdown()
+
+    def _listener(self):
+        # receives broadcast messages from the server in a background thread
+        while self._alive:
+            try:
+                msg = self._net_recv(self._conn)
+            except:
+                self._eq.put(("disconnected",))
+                return
+
+            if msg.get("type") != "MSG":
+                self._log(f"[recv] unexpected type: {msg.get('type')!r}")
+                continue
+
+            sender = msg.get("sender", "?")
+            ct  = bytes.fromhex(msg.get("ct_hex", ""))
+            tag = bytes.fromhex(msg.get("mac_hex", ""))
+            self._log(f"[recv] '{sender}': ct = {ct.hex().upper()[:32]}...")
+
+            # check HMAC before touching plaintext
+            try:
+                chk = CryptoHMAC.new(self._sess["mac"], digestmod=SHA3_512)
+                chk.update(ct)
+                chk.verify(tag)
+            except Exception:
+                self._log(f"[recv] HMAC invalid — dropping message from '{sender}'")
+                self._eq.put(("incoming", sender, "<<HMAC INVALID — dropped>>"))
+                continue
+
+            try:
+                pt = unpad(
+                    AES.new(self._sess["aes"], AES.MODE_CBC, self._sess["iv"]).decrypt(ct),
+                    16
+                )
+                text = pt.decode("utf-8")
+            except Exception:
+                self._log(f"[recv] decryption error from '{sender}'")
+                self._eq.put(("incoming", sender, "<<DECRYPTION FAILED>>"))
+                continue
+
+            self._log(f"[recv] '{sender}': {text}")
+            self._eq.put(("incoming", sender, text))
+
+    # session teardown
+
+    def _shutdown(self):
+        if not self._alive:
+            return
+        self._alive = False
+        if self._conn:
+            try: self._conn.close()
+            except: pass
+        self._conn = None
+        self._sess = None
+        # tell main thread to reset the UI
+        self._eq.put(("disconnected",))
+
+    def _disconnect(self):
+        if self._alive and self._conn:
+            try:
+                self._net_send(self._conn, {"type": "BYE"})
+            except: pass
+        self._shutdown()
+
+    # logging helpers — _log() is safe to call from any thread
+
+    def _log(self, text):
+        self._eq.put(("log", text))
+
+    def _write_log(self, text):
+        # called directly from the main thread (no queue needed)
+        self._log_box.insert(tk.END, text + "\n")
+        self._log_box.see(tk.END)
+
+    # drain the event queue — scheduled every 40ms on the main thread
+
+    def _tick(self):
+        try:
+            while True:
+                ev = self._eq.get_nowait()
+                kind = ev[0]
+
+                if kind == "log":
+                    self._write_log(ev[1])
+
+                elif kind == "incoming":
+                    _, sender, text = ev
+                    self._msg_box.configure(state=tk.NORMAL)
+                    self._msg_box.insert(tk.END, f"[{sender}]  {text}\n")
+                    self._msg_box.see(tk.END)
+                    self._msg_box.configure(state=tk.DISABLED)
+
+                elif kind == "enroll_done":
+                    ok = ev[1]
+                    if ok:
+                        user, ch = ev[2], ev[3]
+                        messagebox.showinfo("Enrolled", f"'{user}' registered on {ch}")
+                    else:
+                        messagebox.showerror("Enrollment failed", "Check the crypto log.")
+                    self._v_rpass.set("")
+
+                elif kind == "login_done":
+                    self._on_login_result(ev[1])
+
+                elif kind == "disconnected":
+                    self._on_disconnected()
+
+        except queue.Empty:
+            pass
+
+        self.root.after(40, self._tick)
+
+    # button handlers
+
+    def _btn_load_keys(self):
+        if not self._v_enc.get() or not self._v_sig.get():
+            messagebox.showerror("Missing files", "Select both PEM files first.")
             return
         try:
-            self.core.load_server_pubkeys(self._enc_pub_path.get(), self._sign_pub_path.get())
-            self._log_threadsafe("Server public keys loaded.")
-        except (ValueError, OSError) as e:
-            messagebox.showerror("Key load failed", str(e))
+            self._load_keys(self._v_enc.get(), self._v_sig.get())
+        except Exception as ex:
+            messagebox.showerror("Load failed", str(ex))
 
-    def _validate_address(self):
-        ip = self._ip_var.get().strip()
+    def _btn_enroll(self):
+        ip, port = self._get_addr() or (None, None)
+        if ip is None:
+            return
+        if not self._pub_enc:
+            messagebox.showerror("Keys not loaded", "Load server keys first.")
+            return
+        user = self._v_ruser.get().strip()
+        pw   = self._v_rpass.get()
+        ch   = self._v_rchan.get()
+        if not user or not pw:
+            messagebox.showerror("Missing input", "Username and password required.")
+            return
+        threading.Thread(
+            target=self._enroll_worker,
+            args=(ip, port, user, pw, ch),
+            daemon=True
+        ).start()
+
+    def _btn_login(self):
+        ip, port = self._get_addr() or (None, None)
+        if ip is None:
+            return
+        if not self._pub_sig:
+            messagebox.showerror("Keys not loaded", "Load server keys first.")
+            return
+        user = self._v_luser.get().strip()
+        pw   = self._v_lpass.get()
+        if not user or not pw:
+            messagebox.showerror("Missing input", "Username and password required.")
+            return
+        self._login_btn.configure(state=tk.DISABLED)
+        self._set_status("● Authenticating...", C_ACC)
+        threading.Thread(
+            target=self._login_worker,
+            args=(ip, port, user, pw),
+            daemon=True
+        ).start()
+
+    def _btn_disconnect(self):
+        self._disconnect()
+
+    def _get_addr(self):
+        ip = self._v_ip.get().strip()
         try:
-            port = int(self._port_var.get())
-            if not (1 <= port <= 65535):
+            port = int(self._v_port.get())
+            if not 1 <= port <= 65535:
                 raise ValueError
         except ValueError:
-            messagebox.showerror("Bad address", "Please enter a valid IP and port (1-65535).")
+            messagebox.showerror("Bad port", "Port must be 1–65535.")
             return None
         return ip, port
 
-    def _on_enroll(self):
-        addr = self._validate_address()
-        if addr is None: return
-        ip, port = addr
+    # UI state changes
 
-        if self.core.server_enc_pub is None:
-            messagebox.showerror("Keys not loaded", "Click 'Load server keys' first.")
-            return
-
-        username = self._reg_user.get().strip()
-        password = self._reg_pass.get()
-        channel = self._reg_channel.get()
-
-        if not username or not password:
-            messagebox.showerror("Missing", "Username and password are required.")
-            return
-        if channel not in CHANNELS:
-            messagebox.showerror("Bad channel", "Channel must be IF100 / MATH101 / SPS101.")
-            return
-
-        def worker():
-            ok = self.core.enroll(ip, port, username, password, channel)
-            if ok:
-                self._gui_q.put(("info", "Enrollment success", f"User '{username}' enrolled on {channel}."))
-            else:
-                self._gui_q.put(("error", "Enrollment failed", "See the log for details."))
-            self._gui_q.put(("clear_reg_pass", None, None))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _on_login(self):
-        addr = self._validate_address()
-        if addr is None: return
-        ip, port = addr
-
-        if self.core.server_sign_pub is None:
-            messagebox.showerror("Keys not loaded", "Click 'Load server keys' first.")
-            return
-
-        username = self._login_user.get().strip()
-        password = self._login_pass.get()
-        if not username or not password:
-            messagebox.showerror("Missing", "Username and password are required.")
-            return
-
-        self._login_btn.configure(state=tk.DISABLED)
-        self._set_status(f"● Authenticating as '{username}'...", _C_ACCENT)
-
-        def worker():
-            result = self.core.login(ip, port, username, password)
-            self._gui_q.put(("login_result", result, username))
-            self._gui_q.put(("clear_login_pass", None, None))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _on_disconnect(self):
-        self.core.disconnect()
-
-    def _on_send(self):
-        text = self._compose_var.get()
-        if not text:
-            return
-        if self.core.send_broadcast(text):
-            self._compose_var.set("")
-
-    def _on_close(self):
-        try:
-            self.core.disconnect()
-        except Exception:
-            pass
-        self.root.destroy()
-
-    def _log_threadsafe(self, message: str):
-        self._gui_q.put(("log", message, None))
-
-    def _state_threadsafe(self, state: str, info: dict):
-        self._gui_q.put(("state", state, info))
-
-    def _msg_threadsafe(self, sender: str, text: str):
-        self._gui_q.put(("msg", sender, text))
-
-    def _poll_gui_queue(self):
-        try:
-            while True:
-                kind, a, b = self._gui_q.get_nowait()
-                if kind == "log":
-                    self._append_log(a)
-                elif kind == "msg":
-                    self._append_message(a, b)
-                elif kind == "state":
-                    self._handle_state(a, b)
-                elif kind == "info":
-                    messagebox.showinfo(a, b)
-                elif kind == "error":
-                    messagebox.showerror(a, b)
-                elif kind == "login_result":
-                    self._handle_login_result(a, b)
-                elif kind == "clear_reg_pass":
-                    self._reg_pass.set("")
-                elif kind == "clear_login_pass":
-                    self._login_pass.set("")
-        except queue.Empty:
-            pass
-        self.root.after(50, self._poll_gui_queue)
-
-    def _append_log(self, text: str):
-        self._log_widget.insert(tk.END, text + "\n")
-        self._log_widget.see(tk.END)
-
-    def _append_message(self, sender: str, text: str):
-        self._messages_widget.configure(state=tk.NORMAL)
-        self._messages_widget.insert(tk.END, f"[{sender}] {text}\n")
-        self._messages_widget.see(tk.END)
-        self._messages_widget.configure(state=tk.DISABLED)
-
-    def _handle_state(self, state: str, _info: dict):
-        if state == "DISCONNECTED":
-            self._set_status("● Not connected", _C_WARN)
-            self._send_btn.configure(state=tk.DISABLED)
-            self._login_btn.configure(state=tk.NORMAL)
-            self._disconnect_btn.configure(state=tk.DISABLED)
-            self._ch_label.configure(text="Channel: (not authenticated)")
-
-    def _handle_login_result(self, result: str, username: str):
+    def _on_login_result(self, result):
+        self._v_lpass.set("")
         if result == "ok":
-            channel = self.core.channel
-            self._login_user.set(username)
+            ch   = self._sess["ch"] if self._sess else "?"
+            user = self._sess["user"] if self._sess else "?"
+            self._v_chanl.set(ch or "?")
             self._send_btn.configure(state=tk.NORMAL)
-            self._disconnect_btn.configure(state=tk.NORMAL)
+            self._disc_btn.configure(state=tk.NORMAL)
             self._login_btn.configure(state=tk.DISABLED)
-            ch_text = channel if channel else "(authenticated)"
-            self._ch_label.configure(text=f"Channel: {ch_text}")
-            self._set_status(f"● Connected as '{username}'  [{ch_text}]", _C_GREEN)
+            self._set_status(f"● {user} @ {ch}", C_OK)
         elif result == "wrong_password":
-            messagebox.showerror("Wrong password", "Decryption failed; the password is likely wrong.")
-            self._set_status("● Not connected", _C_WARN)
+            messagebox.showerror("Wrong password",
+                                 "Decryption failed — check your password.")
+            self._set_status("● Not connected", C_ERR)
             self._login_btn.configure(state=tk.NORMAL)
         elif result == "auth_failed":
-            messagebox.showerror("Authentication failed", "Server rejected the login.")
-            self._set_status("● Not connected", _C_WARN)
+            messagebox.showerror("Auth failed",
+                                 "Server rejected the credentials.")
+            self._set_status("● Not connected", C_ERR)
             self._login_btn.configure(state=tk.NORMAL)
         elif result == "channel_unavailable":
-            messagebox.showwarning("Channel unavailable", "The channel keys have not been generated on the server yet.")
-            self._set_status("● Not connected", _C_WARN)
+            messagebox.showwarning("Channel not ready",
+                                   "Server hasn't generated keys for this channel yet.")
+            self._set_status("● Not connected", C_ERR)
             self._login_btn.configure(state=tk.NORMAL)
         else:
-            messagebox.showerror("Network error", "Could not reach server. See log.")
-            self._set_status("● Not connected", _C_WARN)
+            messagebox.showerror("Connection error",
+                                 "Could not reach the server. See crypto log.")
+            self._set_status("● Not connected", C_ERR)
             self._login_btn.configure(state=tk.NORMAL)
 
-    def _set_status(self, s: str, color: str = _C_WARN):
-        self._status_var.set(s)
+    def _on_disconnected(self):
+        self._set_status("● Not connected", C_ERR)
+        self._send_btn.configure(state=tk.DISABLED)
+        self._login_btn.configure(state=tk.NORMAL)
+        self._disc_btn.configure(state=tk.DISABLED)
+        self._v_chanl.set("—")
+        self._alive = False
+        self._conn  = None
+        self._sess  = None
+
+    def _set_status(self, text, color=C_ERR):
+        self._v_stat.set(text)
         self._status_badge.configure(fg=color)
+
+    # build the window
+
+    def _build(self):
+        # top banner
+        banner = tk.Frame(self.root, bg=C_ACC, height=58)
+        banner.pack(fill=tk.X)
+        banner.pack_propagate(False)
+        tk.Label(banner, text="  CLIENT", bg=C_ACC, fg=C_CARD,
+                 font=(FONT[0], 17, "bold")).pack(side=tk.LEFT, padx=18)
+        tk.Label(banner, text="CS432 Secure Channel", bg=C_ACC, fg=C_BG,
+                 font=(FONT[0], 10)).pack(side=tk.LEFT, padx=4)
+        self._status_badge = tk.Label(
+            banner, textvariable=self._v_stat,
+            bg=C_CARD, fg=C_ERR, font=(FONT[0], 9, "bold"), padx=10, pady=4)
+        self._status_badge.pack(side=tk.RIGHT, padx=18, pady=10)
+
+        body = tk.Frame(self.root, bg=C_BG)
+        body.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
+
+        # left column — form panels
+        left = tk.Frame(body, bg=C_BG)
+        left.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 8))
+
+        # key loading
+        kf = ttk.LabelFrame(left, text="SERVER KEYS & CONNECTION")
+        kf.pack(fill=tk.X, pady=(0, 6))
+
+        def field(parent, label, var, row, pw=False, browse=None):
+            ttk.Label(parent, text=label, style="Card.TLabel").grid(
+                row=row, column=0, sticky="e", padx=(10, 4), pady=4)
+            kw = {"show": "*"} if pw else {}
+            ttk.Entry(parent, textvariable=var, width=28, **kw).grid(
+                row=row, column=1, sticky="we", padx=4)
+            if browse:
+                ttk.Button(parent, text="…", command=browse, width=3).grid(
+                    row=row, column=2, padx=(0, 8))
+
+        field(kf, "Enc PEM:",   self._v_enc,  0,
+              browse=lambda: self._v_enc.set(
+                  filedialog.askopenfilename(title="Enc public key",
+                  filetypes=[("PEM","*.pem"),("All","*.*")]) or self._v_enc.get()))
+        field(kf, "Sig PEM:",   self._v_sig,  1,
+              browse=lambda: self._v_sig.set(
+                  filedialog.askopenfilename(title="Sig public key",
+                  filetypes=[("PEM","*.pem"),("All","*.*")]) or self._v_sig.get()))
+        field(kf, "Server IP:", self._v_ip,   2)
+        field(kf, "Port:",      self._v_port, 3)
+        kf.columnconfigure(1, weight=1)
+        ttk.Button(kf, text="Load Keys",
+                   command=self._btn_load_keys).grid(
+            row=4, column=0, columnspan=3, sticky="we", padx=10, pady=(4, 10))
+
+        # enrollment
+        ef = ttk.LabelFrame(left, text="ENROLLMENT")
+        ef.pack(fill=tk.X, pady=(0, 6))
+        field(ef, "Username:", self._v_ruser, 0)
+        field(ef, "Password:", self._v_rpass, 1, pw=True)
+        ttk.Label(ef, text="Channel:", style="Card.TLabel").grid(
+            row=2, column=0, sticky="e", padx=(10, 4), pady=4)
+        ttk.Combobox(ef, textvariable=self._v_rchan, values=list(CHANNELS),
+                     state="readonly", width=14).grid(row=2, column=1,
+                                                      sticky="w", padx=4)
+        ef.columnconfigure(1, weight=1)
+        ttk.Button(ef, text="Enroll",
+                   command=self._btn_enroll).grid(
+            row=3, column=0, columnspan=3, sticky="we", padx=10, pady=(4, 10))
+
+        # login
+        lf = ttk.LabelFrame(left, text="LOGIN")
+        lf.pack(fill=tk.X, pady=(0, 6))
+        field(lf, "Username:", self._v_luser, 0)
+        field(lf, "Password:", self._v_lpass, 1, pw=True)
+        lf.columnconfigure(1, weight=1)
+        btn_row = tk.Frame(lf, bg=C_CARD)
+        btn_row.grid(row=2, column=0, columnspan=3, sticky="we",
+                     padx=10, pady=(4, 10))
+        self._login_btn = ttk.Button(btn_row, text="Login",
+                                     command=self._btn_login)
+        self._login_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self._disc_btn = ttk.Button(btn_row, text="Disconnect",
+                                    command=self._btn_disconnect,
+                                    state=tk.DISABLED)
+        self._disc_btn.pack(side=tk.LEFT)
+
+        # channel indicator
+        ci = tk.Frame(left, bg=C_BAND, padx=10, pady=6)
+        ci.pack(fill=tk.X, pady=(0, 6))
+        tk.Label(ci, text="Channel:", bg=C_BAND, fg=C_DARK,
+                 font=(FONT[0], 9)).pack(side=tk.LEFT)
+        tk.Label(ci, textvariable=self._v_chanl, bg=C_BAND, fg=C_DARK,
+                 font=(FONT[0], 9, "bold")).pack(side=tk.LEFT, padx=(4, 0))
+
+        # right side — notebook
+        nb = ttk.Notebook(body)
+        nb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # messages tab
+        chat = ttk.Frame(nb)
+        # send bar must be packed BEFORE the text box so it doesn't get hidden
+        send_bar = tk.Frame(chat, bg=C_BAND)
+        send_bar.pack(side=tk.BOTTOM, fill=tk.X)
+        self._compose = tk.StringVar()
+        self._compose_entry = ttk.Entry(send_bar, textvariable=self._compose)
+        self._compose_entry.pack(side=tk.LEFT, fill=tk.X, expand=True,
+                                 padx=(8, 4), pady=8)
+        self._compose_entry.bind("<Return>", lambda _: self._send_msg())
+        self._send_btn = ttk.Button(send_bar, text="Send ▶",
+                                    command=self._send_msg, state=tk.DISABLED)
+        self._send_btn.pack(side=tk.LEFT, padx=(0, 8), pady=8)
+
+        msg_scr = ttk.Scrollbar(chat)
+        msg_scr.pack(side=tk.RIGHT, fill=tk.Y)
+        self._msg_box = tk.Text(chat, wrap=tk.WORD, state=tk.DISABLED,
+                                bg=C_CARD, fg=C_INK, relief="flat",
+                                borderwidth=0, font=FONT, padx=10, pady=8,
+                                yscrollcommand=msg_scr.set)
+        self._msg_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        msg_scr.configure(command=self._msg_box.yview)
+        nb.add(chat, text="  Messages  ")
+
+        # crypto log tab
+        logf = ttk.Frame(nb)
+        log_scr = ttk.Scrollbar(logf)
+        log_scr.pack(side=tk.RIGHT, fill=tk.Y)
+        self._log_box = tk.Text(logf, wrap=tk.WORD, bg=C_CARD, fg=C_SUB,
+                                relief="flat", borderwidth=0, font=MONO,
+                                padx=8, pady=6,
+                                yscrollcommand=log_scr.set)
+        self._log_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        log_scr.configure(command=self._log_box.yview)
+        nb.add(logf, text="  Crypto Log  ")
+
+    def _quit(self):
+        try: self._disconnect()
+        except: pass
+        self.root.destroy()
 
     def run(self):
         self.root.mainloop()
 
 
 if __name__ == "__main__":
-    ClientGUI().run()
+    SecureClient().run()
