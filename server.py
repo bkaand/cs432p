@@ -7,11 +7,161 @@ import json
 import os
 import queue
 import socket
+import struct
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-import crypto_utils as cu
+from Crypto.Cipher import AES, PKCS1_OAEP
+from Crypto.Hash import SHA3_512, HMAC as PyHMAC
+from Crypto.PublicKey import RSA
+from Crypto.Random import get_random_bytes
+from Crypto.Signature import pkcs1_15
+from Crypto.Util.Padding import pad, unpad
+
+
+# --- constants ---
+CHANNELS = ("IF100", "MATH101", "SPS101")
+
+AES_BLOCK_SIZE = 16
+AES_KEY_LEN = 32
+HMAC_KEY_LEN = 32
+NONCE_LEN = 16
+
+AUTH_OK_TEXT = b"Authentication Successful"
+AUTH_FAIL_TEXT = b"Authentication Unsuccessful"
+AUTH_CHANNEL_UNAVAILABLE = b"Channel Unavailable"
+
+
+# --- crypto helpers ---
+def sha3_512(data: bytes) -> bytes:
+    h = SHA3_512.new()
+    h.update(data)
+    return h.digest()
+
+
+def reverse_str(s: str) -> str:
+    return s[::-1]
+
+
+def derive_aes_key_iv_from_hash(h: bytes):
+    """key = h[0:32], iv = h[32:48]. last 16 bytes are unused."""
+    if len(h) != 64:
+        raise ValueError("Expected a 64-byte hash for key/IV derivation")
+    return h[0:AES_KEY_LEN], h[AES_KEY_LEN:AES_KEY_LEN + AES_BLOCK_SIZE]
+
+
+def derive_hmac_key_from_hash(h: bytes) -> bytes:
+    """first 32 bytes of the hash become the hmac key."""
+    if len(h) != 64:
+        raise ValueError("Expected a 64-byte hash for HMAC key derivation")
+    return h[0:HMAC_KEY_LEN]
+
+
+def aes_encrypt(key: bytes, iv: bytes, plaintext: bytes) -> bytes:
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    return cipher.encrypt(pad(plaintext, AES_BLOCK_SIZE))
+
+
+def hmac_sha3_512(key: bytes, data: bytes) -> bytes:
+    h = PyHMAC.new(key, digestmod=SHA3_512)
+    h.update(data)
+    return h.digest()
+
+
+def hmac_verify(key: bytes, data: bytes, mac: bytes) -> bool:
+    """constant-time hmac check."""
+    try:
+        h = PyHMAC.new(key, digestmod=SHA3_512)
+        h.update(data)
+        h.verify(mac)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+def load_rsa_key_from_file(path: str):
+    with open(path, "rb") as f:
+        return RSA.import_key(f.read())
+
+
+def rsa_decrypt(prv_key, ciphertext: bytes) -> bytes:
+    """oaep with sha3-512."""
+    cipher = PKCS1_OAEP.new(prv_key, hashAlgo=SHA3_512)
+    return cipher.decrypt(ciphertext)
+
+
+def rsa_sign(prv_key, data: bytes) -> bytes:
+    """pkcs1v15 over sha3-512."""
+    h = SHA3_512.new(data)
+    return pkcs1_15.new(prv_key).sign(h)
+
+
+def csprng_bytes(n: int) -> bytes:
+    return get_random_bytes(n)
+
+
+def _recv_exact(sock: socket.socket, n: int) -> bytes:
+    """read exactly n bytes or raise on eof."""
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("socket closed before all bytes received")
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def send_msg(sock: socket.socket, obj: dict) -> None:
+    """send dict as length-prefixed utf-8 json."""
+    raw = json.dumps(obj, separators=(",", ":")).encode("utf-8")
+    sock.sendall(struct.pack(">I", len(raw)) + raw)
+
+
+def recv_msg(sock: socket.socket) -> dict:
+    """receive a length-prefixed json frame."""
+    length_prefix = _recv_exact(sock, 4)
+    (length,) = struct.unpack(">I", length_prefix)
+    if length == 0 or length > 16 * 1024 * 1024:
+        raise ValueError(f"unreasonable frame length: {length}")
+    raw = _recv_exact(sock, length)
+    return json.loads(raw.decode("utf-8"))
+
+
+def to_hex(b: bytes) -> str:
+    return b.hex().upper()
+
+
+def from_hex(h: str) -> bytes:
+    return bytes.fromhex(h)
+
+
+def short_hex(b: bytes, head: int = 16, tail: int = 8) -> str:
+    """truncated hex for log lines — keeps first/last few bytes."""
+    h = to_hex(b)
+    if len(b) <= head + tail:
+        return h
+    return f"{h[: head * 2]}...{h[-tail * 2:]} ({len(b)} bytes)"
+
+
+def decode_enrollment(payload: bytes):
+    """returns (username, h_pw, h_rev_pw, channel)."""
+    if len(payload) < 1 + 1 + 64 + 64 + 1 + 1:
+        raise ValueError("Enrollment payload too short")
+    i = 0
+    ulen = payload[i]; i += 1
+    if ulen < 1 or ulen > 32 or i + ulen > len(payload):
+        raise ValueError("Bad username length")
+    username = payload[i:i + ulen].decode("utf-8"); i += ulen
+    if i + 64 + 64 + 1 > len(payload):
+        raise ValueError("Enrollment payload truncated before hashes")
+    h_pw = payload[i:i + 64]; i += 64
+    h_rev_pw = payload[i:i + 64]; i += 64
+    clen = payload[i]; i += 1
+    if clen < 1 or clen > 16 or i + clen != len(payload):
+        raise ValueError("Bad channel length / trailing bytes")
+    channel = payload[i:i + clen].decode("utf-8")
+    return username, h_pw, h_rev_pw, channel
 
 
 ENROLLMENT_DB_FILE = "server_enrollments.json"
@@ -64,23 +214,23 @@ class SecureChannelServer:
 
     def load_rsa_keys(self, enc_dec_path: str, sign_path: str) -> None:
         """load both rsa-3072 key pairs from pem files."""
-        self.enc_dec_key = cu.load_rsa_key_from_file(enc_dec_path)
-        self.sign_key = cu.load_rsa_key_from_file(sign_path)
+        self.enc_dec_key = load_rsa_key_from_file(enc_dec_path)
+        self.sign_key = load_rsa_key_from_file(sign_path)
         self.log_cb("server", f"Loaded enc/dec key from: {enc_dec_path}")
-        self.log_cb("server", f"  modulus n  (hex): {cu.to_hex(self.enc_dec_key.n.to_bytes(384, 'big'))}")
-        self.log_cb("server", f"  public  e  (hex): {cu.to_hex(self.enc_dec_key.e.to_bytes((self.enc_dec_key.e.bit_length() + 7) // 8, 'big'))}")
-        self.log_cb("server", f"  private d  (hex): {cu.to_hex(self.enc_dec_key.d.to_bytes(384, 'big'))}")
+        self.log_cb("server", f"  modulus n  (hex): {to_hex(self.enc_dec_key.n.to_bytes(384, 'big'))}")
+        self.log_cb("server", f"  public  e  (hex): {to_hex(self.enc_dec_key.e.to_bytes((self.enc_dec_key.e.bit_length() + 7) // 8, 'big'))}")
+        self.log_cb("server", f"  private d  (hex): {to_hex(self.enc_dec_key.d.to_bytes(384, 'big'))}")
         self.log_cb("server", f"Loaded sign/verify key from: {sign_path}")
-        self.log_cb("server", f"  modulus n  (hex): {cu.to_hex(self.sign_key.n.to_bytes(384, 'big'))}")
-        self.log_cb("server", f"  public  e  (hex): {cu.to_hex(self.sign_key.e.to_bytes((self.sign_key.e.bit_length() + 7) // 8, 'big'))}")
-        self.log_cb("server", f"  private d  (hex): {cu.to_hex(self.sign_key.d.to_bytes(384, 'big'))}")
+        self.log_cb("server", f"  modulus n  (hex): {to_hex(self.sign_key.n.to_bytes(384, 'big'))}")
+        self.log_cb("server", f"  public  e  (hex): {to_hex(self.sign_key.e.to_bytes((self.sign_key.e.bit_length() + 7) // 8, 'big'))}")
+        self.log_cb("server", f"  private d  (hex): {to_hex(self.sign_key.d.to_bytes(384, 'big'))}")
 
     def generate_channel_keys(self, channel: str, master_secret: str) -> None:
         """
         derive aes key, iv, hmac key from the master secret.
         keys are fixed once set — re-generation is rejected per spec.
         """
-        if channel not in cu.CHANNELS:
+        if channel not in CHANNELS:
             raise ValueError(f"Unknown channel: {channel}")
 
         with self._channel_lock:
@@ -92,22 +242,22 @@ class SecureChannelServer:
                 )
                 return
 
-            h = cu.sha3_512(master_secret.encode("utf-8"))
-            hr = cu.sha3_512(cu.reverse_str(master_secret).encode("utf-8"))
-            aes_key, iv = cu.derive_aes_key_iv_from_hash(h)
-            hmac_key = cu.derive_hmac_key_from_hash(hr)
+            h = sha3_512(master_secret.encode("utf-8"))
+            hr = sha3_512(reverse_str(master_secret).encode("utf-8"))
+            aes_key, iv = derive_aes_key_iv_from_hash(h)
+            hmac_key = derive_hmac_key_from_hash(hr)
 
             self.channel_keys[channel] = {
                 "aes_key": aes_key,
                 "iv": iv,
                 "hmac_key": hmac_key,
-                "master_hex": cu.to_hex(h),
+                "master_hex": to_hex(h),
             }
 
-        self.log_cb(channel, f"Master secret hash (SHA3-512): {cu.to_hex(h)}")
-        self.log_cb(channel, f"Derived AES-256 key:  {cu.to_hex(aes_key)}")
-        self.log_cb(channel, f"Derived AES IV:       {cu.to_hex(iv)}")
-        self.log_cb(channel, f"Derived HMAC key:     {cu.to_hex(hmac_key)}")
+        self.log_cb(channel, f"Master secret hash (SHA3-512): {to_hex(h)}")
+        self.log_cb(channel, f"Derived AES-256 key:  {to_hex(aes_key)}")
+        self.log_cb(channel, f"Derived AES IV:       {to_hex(iv)}")
+        self.log_cb(channel, f"Derived HMAC key:     {to_hex(hmac_key)}")
         self.event_cb("channel_keys_ready", {"channel": channel})
 
     def start(self, port: int) -> None:
@@ -140,8 +290,6 @@ class SecureChannelServer:
         except OSError:
             pass
 
-        # shutdown before close so threads blocked in recv() wake up
-        # and the kernel sends FIN to the other end
         with self._conn_lock:
             users = list(self.active.items())
         for username, info in users:
@@ -163,7 +311,6 @@ class SecureChannelServer:
             try:
                 client_sock, addr = self._listen_sock.accept()
             except OSError:
-                # socket was closed, time to stop
                 break
             self.log_cb("server", f"Incoming connection from {addr[0]}:{addr[1]}")
             t = threading.Thread(
@@ -179,12 +326,11 @@ class SecureChannelServer:
         username = None
         channel = None
         try:
-            first = cu.recv_msg(sock)
+            first = recv_msg(sock)
             mtype = first.get("type")
 
             if mtype == "ENROLL_REQ":
                 self._handle_enrollment(sock, first, addr)
-                # one-shot, close after
                 return
 
             if mtype == "AUTH_REQ":
@@ -199,7 +345,6 @@ class SecureChannelServer:
         except (ConnectionError, OSError, ValueError) as e:
             self.log_cb("server", f"Connection error with {addr}: {e}")
         finally:
-            # drop from active sessions if this was an authenticated conn
             if username is not None:
                 with self._conn_lock:
                     if username in self.active and self.active[username]["sock"] is sock:
@@ -217,30 +362,30 @@ class SecureChannelServer:
     def _handle_enrollment(self, sock: socket.socket, msg: dict, addr) -> None:
         """decrypt the enrollment payload, check uniqueness, store user, send signed response."""
         try:
-            ciphertext = cu.from_hex(msg["payload_hex"])
+            ciphertext = from_hex(msg["payload_hex"])
         except (KeyError, ValueError):
             self._send_signed_text(sock, "error: malformed enrollment request")
             return
 
         self.log_cb("server", f"[Enrollment] Received encrypted payload from {addr}")
-        self.log_cb("server", f"  ciphertext: {cu.short_hex(ciphertext)}")
+        self.log_cb("server", f"  ciphertext: {short_hex(ciphertext)}")
 
         try:
-            plaintext = cu.rsa_decrypt(self.enc_dec_key, ciphertext)
+            plaintext = rsa_decrypt(self.enc_dec_key, ciphertext)
         except ValueError as e:
             self.log_cb("server", f"[Enrollment] RSA decryption failed: {e}")
             self._send_signed_text(sock, "error: rsa decryption failed")
             return
 
         try:
-            username, h_pw, h_rev_pw, channel = cu.decode_enrollment(plaintext)
+            username, h_pw, h_rev_pw, channel = decode_enrollment(plaintext)
         except ValueError as e:
             self.log_cb("server", f"[Enrollment] Could not parse decrypted payload: {e}")
             self._send_signed_text(sock, "error: malformed enrollment payload")
             return
 
-        h_pw_hex = cu.to_hex(h_pw)
-        h_rev_pw_hex = cu.to_hex(h_rev_pw)
+        h_pw_hex = to_hex(h_pw)
+        h_rev_pw_hex = to_hex(h_rev_pw)
 
         self.log_cb("server", "[Enrollment] Decrypted payload:")
         self.log_cb("server", f"  username: {username}")
@@ -251,7 +396,7 @@ class SecureChannelServer:
         if not username or len(username) > 32:
             self._send_signed_text(sock, "error: invalid username")
             return
-        if channel not in cu.CHANNELS:
+        if channel not in CHANNELS:
             self._send_signed_text(sock, "error: invalid channel")
             return
 
@@ -282,15 +427,15 @@ class SecureChannelServer:
     def _send_signed_text(self, sock: socket.socket, text: str) -> None:
         """send a text response with the server's rsa signature."""
         text_bytes = text.encode("utf-8")
-        sig = cu.rsa_sign(self.sign_key, text_bytes)
+        sig = rsa_sign(self.sign_key, text_bytes)
         self.log_cb("server", f"[Enrollment] Sending signed response: '{text}'")
-        self.log_cb("server", f"  signature: {cu.short_hex(sig)}")
-        cu.send_msg(
+        self.log_cb("server", f"  signature: {short_hex(sig)}")
+        send_msg(
             sock,
             {
                 "type": "ENROLL_RESP",
                 "message": text,
-                "signature_hex": cu.to_hex(sig),
+                "signature_hex": to_hex(sig),
             },
         )
 
@@ -303,16 +448,15 @@ class SecureChannelServer:
             user_record = self.enrollments.get(username)
 
         if user_record is None:
-            # still send a challenge so we don't leak which usernames exist
             self.log_cb("server", f"[Auth] No such user '{username}'. Will fail HMAC.")
 
         # step 1: send 128-bit challenge
-        challenge = cu.csprng_bytes(cu.NONCE_LEN)
-        self.log_cb("server", f"[Auth] Generated 128-bit challenge: {cu.to_hex(challenge)}")
-        cu.send_msg(sock, {"type": "AUTH_CHALLENGE", "challenge_hex": cu.to_hex(challenge)})
+        challenge = csprng_bytes(NONCE_LEN)
+        self.log_cb("server", f"[Auth] Generated 128-bit challenge: {to_hex(challenge)}")
+        send_msg(sock, {"type": "AUTH_CHALLENGE", "challenge_hex": to_hex(challenge)})
 
         # step 2: get the hmac back
-        resp = cu.recv_msg(sock)
+        resp = recv_msg(sock)
         if resp.get("type") != "AUTH_HMAC":
             self.log_cb("server", "[Auth] Expected AUTH_HMAC, got something else. Aborting.")
             return None
@@ -322,37 +466,36 @@ class SecureChannelServer:
         # step 3: verify hmac
         ok = False
         if user_record is not None:
-            h_pw = cu.from_hex(user_record["h_pw_hex"])
-            hmac_key = cu.derive_hmac_key_from_hash(h_pw)
-            expected = cu.hmac_sha3_512(hmac_key, challenge)
-            self.log_cb("server", f"[Auth] Expected HMAC:        {cu.to_hex(expected)}")
+            h_pw = from_hex(user_record["h_pw_hex"])
+            hmac_key = derive_hmac_key_from_hash(h_pw)
+            expected = hmac_sha3_512(hmac_key, challenge)
+            self.log_cb("server", f"[Auth] Expected HMAC:        {to_hex(expected)}")
             try:
-                ok = cu.hmac_verify(hmac_key, challenge, cu.from_hex(client_mac_hex))
+                ok = hmac_verify(hmac_key, challenge, from_hex(client_mac_hex))
             except ValueError:
                 ok = False
 
         # ack key comes from h(rev_pw) stored at enrollment
         if user_record is not None:
-            h_rev_pw = cu.from_hex(user_record["h_rev_pw_hex"])
-            ack_aes_key, ack_iv = cu.derive_aes_key_iv_from_hash(h_rev_pw)
+            h_rev_pw = from_hex(user_record["h_rev_pw_hex"])
+            ack_aes_key, ack_iv = derive_aes_key_iv_from_hash(h_rev_pw)
         else:
-            # no record — use random key so the protocol stays uniform
-            ack_aes_key = cu.csprng_bytes(cu.AES_KEY_LEN)
-            ack_iv = cu.csprng_bytes(cu.AES_BLOCK_SIZE)
+            ack_aes_key = csprng_bytes(AES_KEY_LEN)
+            ack_iv = csprng_bytes(AES_BLOCK_SIZE)
 
         # step 4a: hmac failed
         if not ok:
             self.log_cb("server", "[Auth] HMAC verification FAILED.")
-            ct = cu.aes_encrypt(ack_aes_key, ack_iv, cu.AUTH_FAIL_TEXT)
-            sig = cu.rsa_sign(self.sign_key, ct)
-            self.log_cb("server", f"[Auth] Encrypted negative ack: {cu.short_hex(ct)}")
-            self.log_cb("server", f"[Auth] Signature:              {cu.short_hex(sig)}")
-            cu.send_msg(
+            ct = aes_encrypt(ack_aes_key, ack_iv, AUTH_FAIL_TEXT)
+            sig = rsa_sign(self.sign_key, ct)
+            self.log_cb("server", f"[Auth] Encrypted negative ack: {short_hex(ct)}")
+            self.log_cb("server", f"[Auth] Signature:              {short_hex(sig)}")
+            send_msg(
                 sock,
                 {
                     "type": "AUTH_RESULT",
-                    "ciphertext_hex": cu.to_hex(ct),
-                    "signature_hex": cu.to_hex(sig),
+                    "ciphertext_hex": to_hex(ct),
+                    "signature_hex": to_hex(sig),
                 },
             )
             return None
@@ -369,14 +512,14 @@ class SecureChannelServer:
                 "server",
                 f"[Auth] Channel '{channel}' has no keys yet. Sending 'Channel Unavailable'.",
             )
-            ct = cu.aes_encrypt(ack_aes_key, ack_iv, cu.AUTH_CHANNEL_UNAVAILABLE)
-            sig = cu.rsa_sign(self.sign_key, ct)
-            cu.send_msg(
+            ct = aes_encrypt(ack_aes_key, ack_iv, AUTH_CHANNEL_UNAVAILABLE)
+            sig = rsa_sign(self.sign_key, ct)
+            send_msg(
                 sock,
                 {
                     "type": "AUTH_RESULT",
-                    "ciphertext_hex": cu.to_hex(ct),
-                    "signature_hex": cu.to_hex(sig),
+                    "ciphertext_hex": to_hex(ct),
+                    "signature_hex": to_hex(sig),
                 },
             )
             return None
@@ -388,14 +531,14 @@ class SecureChannelServer:
                     "server",
                     f"[Auth] User '{username}' is already connected from another session.",
                 )
-                ct = cu.aes_encrypt(ack_aes_key, ack_iv, cu.AUTH_FAIL_TEXT)
-                sig = cu.rsa_sign(self.sign_key, ct)
-                cu.send_msg(
+                ct = aes_encrypt(ack_aes_key, ack_iv, AUTH_FAIL_TEXT)
+                sig = rsa_sign(self.sign_key, ct)
+                send_msg(
                     sock,
                     {
                         "type": "AUTH_RESULT",
-                        "ciphertext_hex": cu.to_hex(ct),
-                        "signature_hex": cu.to_hex(sig),
+                        "ciphertext_hex": to_hex(ct),
+                        "signature_hex": to_hex(sig),
                     },
                 )
                 return None
@@ -404,23 +547,23 @@ class SecureChannelServer:
 
         # success payload: auth ok text + channel keys + channel name
         payload = (
-            cu.AUTH_OK_TEXT
+            AUTH_OK_TEXT
             + ckeys["aes_key"]
             + ckeys["iv"]
             + ckeys["hmac_key"]
             + channel.encode("utf-8")
         )
-        ct = cu.aes_encrypt(ack_aes_key, ack_iv, payload)
-        sig = cu.rsa_sign(self.sign_key, ct)
-        self.log_cb("server", f"[Auth] Encrypted positive ack (with channel keys): {cu.short_hex(ct)}")
-        self.log_cb("server", f"[Auth] Signature: {cu.short_hex(sig)}")
+        ct = aes_encrypt(ack_aes_key, ack_iv, payload)
+        sig = rsa_sign(self.sign_key, ct)
+        self.log_cb("server", f"[Auth] Encrypted positive ack (with channel keys): {short_hex(ct)}")
+        self.log_cb("server", f"[Auth] Signature: {short_hex(sig)}")
 
-        cu.send_msg(
+        send_msg(
             sock,
             {
                 "type": "AUTH_RESULT",
-                "ciphertext_hex": cu.to_hex(ct),
-                "signature_hex": cu.to_hex(sig),
+                "ciphertext_hex": to_hex(ct),
+                "signature_hex": to_hex(sig),
             },
         )
         self.log_cb(
@@ -432,7 +575,7 @@ class SecureChannelServer:
     def _broadcast_loop(self, sock: socket.socket, username: str, channel: str) -> None:
         while True:
             try:
-                msg = cu.recv_msg(sock)
+                msg = recv_msg(sock)
             except (ConnectionError, OSError, ValueError):
                 return
 
@@ -442,8 +585,8 @@ class SecureChannelServer:
                 mac_hex = msg.get("hmac_hex", "")
                 self.log_cb(
                     channel,
-                    f"<- '{username}' broadcast | ct={cu.short_hex(cu.from_hex(ct_hex)) if ct_hex else ''}"
-                    f" | hmac={cu.short_hex(cu.from_hex(mac_hex)) if mac_hex else ''}",
+                    f"<- '{username}' broadcast | ct={short_hex(from_hex(ct_hex)) if ct_hex else ''}"
+                    f" | hmac={short_hex(from_hex(mac_hex)) if mac_hex else ''}",
                 )
                 self._relay(channel, username, ct_hex, mac_hex)
             elif mtype == "DISCONNECT":
@@ -470,7 +613,7 @@ class SecureChannelServer:
         delivered = 0
         for uname, rsock in recipients:
             try:
-                cu.send_msg(rsock, out)
+                send_msg(rsock, out)
                 delivered += 1
             except (OSError, ConnectionError):
                 pass
@@ -495,11 +638,9 @@ class ServerGUI:
         self.root.title("CS432 Project — Secure Channel Server")
         self.root.geometry("1100x780")
 
-        # queue for cross-thread updates
         self._gui_q = queue.Queue()
         self.root.after(50, self._poll_gui_queue)
 
-        # log widgets keyed by channel name; "server" -> master log
         self._log_widgets = {}
 
         self.core = SecureChannelServer(
@@ -511,8 +652,8 @@ class ServerGUI:
         self._sign_path = tk.StringVar()
         self._port_var = tk.StringVar(value="6000")
 
-        self._master_secrets = {ch: tk.StringVar() for ch in cu.CHANNELS}
-        self._master_status = {ch: tk.StringVar(value="not generated") for ch in cu.CHANNELS}
+        self._master_secrets = {ch: tk.StringVar() for ch in CHANNELS}
+        self._master_status = {ch: tk.StringVar(value="not generated") for ch in CHANNELS}
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -520,7 +661,6 @@ class ServerGUI:
     def _build_ui(self):
         pad = {"padx": 6, "pady": 4}
 
-        # --- Top: server setup ---
         setup = ttk.LabelFrame(self.root, text="Server Setup")
         setup.pack(fill=tk.X, **pad)
 
@@ -542,27 +682,24 @@ class ServerGUI:
         self._stop_btn = ttk.Button(btnbar, text="Stop Server", command=self._on_stop, state=tk.DISABLED)
         self._stop_btn.pack(side=tk.LEFT, padx=4)
 
-        # --- Channel master secrets ---
         ms = ttk.LabelFrame(self.root, text="Per-Channel Master Secret  (keys are derived once and remain fixed)")
         ms.pack(fill=tk.X, **pad)
 
-        for i, ch in enumerate(cu.CHANNELS):
+        for i, ch in enumerate(CHANNELS):
             ttk.Label(ms, text=f"{ch}:", width=10).grid(row=i, column=0, sticky="e", padx=4, pady=2)
             ttk.Entry(ms, textvariable=self._master_secrets[ch], width=40, show="*").grid(row=i, column=1, sticky="we")
             ttk.Button(ms, text="Generate Keys", command=lambda c=ch: self._on_generate(c)).grid(row=i, column=2, padx=4)
             ttk.Label(ms, textvariable=self._master_status[ch], foreground="#444", width=20).grid(row=i, column=3, sticky="w")
 
-        # active clients
         active = ttk.LabelFrame(self.root, text="Online clients")
         active.pack(fill=tk.X, **pad)
         self._active_list = tk.Listbox(active, height=4)
         self._active_list.pack(fill=tk.X, padx=4, pady=4)
 
-        # logs
         nb = ttk.Notebook(self.root)
         nb.pack(fill=tk.BOTH, expand=True, **pad)
 
-        for ch in cu.CHANNELS:
+        for ch in CHANNELS:
             frame = ttk.Frame(nb)
             txt = tk.Text(frame, wrap=tk.WORD, height=18)
             scr = ttk.Scrollbar(frame, command=txt.yview)
@@ -572,7 +709,6 @@ class ServerGUI:
             nb.add(frame, text=f"Channel {ch}")
             self._log_widgets[ch] = txt
 
-        # server-wide log tab
         frame_s = ttk.Frame(nb)
         txt_s = tk.Text(frame_s, wrap=tk.WORD, height=18)
         scr_s = ttk.Scrollbar(frame_s, command=txt_s.yview)
@@ -644,7 +780,6 @@ class ServerGUI:
             pass
         self.root.destroy()
 
-    # thread-safe updates
     def _log_threadsafe(self, target: str, message: str):
         self._gui_q.put(("log", target, message))
 
