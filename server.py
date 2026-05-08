@@ -1,5 +1,5 @@
-# CS432 / 532 Spring 2026
-# server side — handles enrollment, login (challenge-response), and broadcast relay
+# server 
+# mehmet emre tekesin -- bilgekagan durmaz
 
 import json
 import os
@@ -43,15 +43,14 @@ FONT = ("Lucida Console", 9)
 MONO = ("Lucida Console", 9)
 
 
-# wraps a client socket with a read buffer so we handle partial TCP reads correctly.
-# without this you can get half a message which breaks json.loads
+# socket wrapper that buffers reads so partial TCP messages dont break json parsing
 class Connection:
     def __init__(self, sock):
         self._sock = sock
         self._rbuf = b""
 
     def recv(self):
-        # fill buffer until we have the 4-byte length prefix
+        # keep reading until we have the 4 byte header
         while len(self._rbuf) < 4:
             chunk = self._sock.recv(4096)
             if not chunk:
@@ -60,13 +59,13 @@ class Connection:
 
         mlen = struct.unpack(">I", self._rbuf[:4])[0]
         if mlen == 0 or mlen > 16 * 1024 * 1024:
-            raise ValueError(f"weird frame length: {mlen}")
+            raise ValueError(f"frame length {mlen} out of range")
         self._rbuf = self._rbuf[4:]
 
         while len(self._rbuf) < mlen:
             chunk = self._sock.recv(4096)
             if not chunk:
-                raise ConnectionError("connection dropped in the middle of a message")
+                raise ConnectionError("dropped mid message")
             self._rbuf += chunk
 
         data = self._rbuf[:mlen]
@@ -88,11 +87,11 @@ class Connection:
             pass
 
 
-# main server class — all the crypto is in here as static methods so
-# i don't have a bunch of loose functions floating around at module level
+# main server class -- all crypto helpers are static methods inside so
+# module level stays clean
 class ChannelServer:
 
-    # crypto helpers (static so they don't need self, but still scoped to this class)
+    # crypto helpers -- static so they dont need self, just grouped here
 
     @staticmethod
     def _sha3(data: bytes) -> bytes:
@@ -116,7 +115,7 @@ class ChannelServer:
 
     @staticmethod
     def _hmac_ok(key, data, tag):
-        # returns True if tag matches, False otherwise (timing-safe via verify())
+        # timing safe -- verify() raises on mismatch rather than returning false
         try:
             mac = CryptoHMAC.new(key, digestmod=SHA3_512)
             mac.update(data)
@@ -139,7 +138,7 @@ class ChannelServer:
 
     @staticmethod
     def _kiv(h64: bytes):
-        # split 64-byte hash into aes key (first 32) and iv (next 16)
+        # first 32 = key, next 16 = iv, last 16 unused
         return h64[:SYMKEY_LEN], h64[SYMKEY_LEN : SYMKEY_LEN + BLOCK_SIZE]
 
     @staticmethod
@@ -152,7 +151,7 @@ class ChannelServer:
 
     @staticmethod
     def _fmt(b, w=12):
-        # abbreviated hex for display — show start and end with length
+        # abbreviated hex for log output, keeps lines readable
         s = b.hex().upper()
         if len(b) <= w * 2:
             return s
@@ -160,10 +159,8 @@ class ChannelServer:
 
     @staticmethod
     def _parse_enroll(raw: bytes):
-        # binary layout (hashes first, then identifiers):
-        # [64B H(pw)] [64B H(rev_pw)] [1B ulen] [username] [1B clen] [channel]
-        # this format was chosen because RSA-3072 OAEP + SHA3-512 has a ~254B cap
-        # and base64/hex encoding would blow past that
+        # format: [64B H(pw)] [64B H(rpw)] [1B ulen] [username] [1B clen] [channel]
+        # hashes go first so the payload fits under RSA-3072 OAEP limit (~254B)
         if len(raw) < 64 + 64 + 3:
             raise ValueError("payload too short to be valid")
         pos = 0
@@ -183,23 +180,23 @@ class ChannelServer:
         return uname, h_pw, h_rpw, chan
 
     def __init__(self, log_fn, ev_fn):
-        self._log = log_fn   # log_fn(tab_name, message_text)
-        self._ev  = ev_fn    # ev_fn(event_name, data)
+        self._log = log_fn   # log_fn(tab, msg)
+        self._ev  = ev_fn    # ev_fn(event, data)
 
         self._enc_key = None
         self._sig_key = None
         self._lsock   = None
         self._running = False
 
-        # db: {username: {"pw": hex, "rpw": hex, "ch": channel_name}}
+        # db: username -> pw hash, rpw hash, channel
         self._db_mu = threading.Lock()
         self._db    = self._load_db()
 
-        # channel keys: {channel: (aes_key, iv, hmac_key)} — tuples, immutable once set
+        # channel -> (aes key, iv, hmac key) as tuples so nothing changes after being set
         self._key_mu = threading.Lock()
         self._ckeys  = {}
 
-        # currently logged-in users: {username: (Connection, channel, addr)}
+        # online users: username -> (conn, channel, addr)
         self._sess_mu  = threading.Lock()
         self._sessions = {}
 
@@ -231,11 +228,11 @@ class ChannelServer:
                 self._log("server", f"[{channel}] keys already set, not regenerating")
                 return
 
-            # AES key + IV come from sha3(master)
+            # aes key+iv from sha3(master)
             h_fwd = self._sha3(master.encode())
             aes_k, iv = self._kiv(h_fwd)
 
-            # HMAC key comes from sha3(reversed master) — different hash for independence
+            # hmac key from sha3(reversed master) to keep it independent from enc key
             h_rev  = self._sha3(master[::-1].encode())
             hmac_k = h_rev[:SYMKEY_LEN]
 
@@ -285,7 +282,7 @@ class ChannelServer:
         with self._db_mu:
             return [(u, r["ch"]) for u, r in self._db.items()]
 
-    # broadcast relay — server never decrypts, just passes the ciphertext along
+    # server doesnt decrypt, just forwards ciphertext to everyone in the channel
 
     def _fanout(self, channel, sender, ct_h, mac_h):
         pkt = {
@@ -308,7 +305,7 @@ class ChannelServer:
         self._log(channel, f"-> relayed from '{sender}' to {sent} client(s)")
 
     def _broadcast_loop(self, conn, username, channel):
-        # just keep reading and relaying — server doesn't care about the content
+        # just relay messages, server doesnt look at the content
         while True:
             try:
                 msg = conn.recv()
@@ -328,7 +325,7 @@ class ChannelServer:
             else:
                 self._log("server", f"got unknown msg type '{kind}' from '{username}'")
 
-    # auth — challenge-response with HMAC-SHA3-512
+    # challenge-response auth using HMAC-SHA3-512
 
     def _authenticate(self, conn, msg, addr):
         uname = msg.get("user", "").strip()
@@ -338,13 +335,13 @@ class ChannelServer:
             rec = self._db.get(uname)
 
         if rec is None:
-            self._log("server", f"[auth] '{uname}' not found in DB — will still challenge to avoid username enumeration")
+            self._log("server", f"[auth] '{uname}' not in DB -- challenging anyway to avoid leaking valid usernames")
 
-        # check now if they're already online (saves a round trip if they are)
+        # check if already logged in before sending the challenge
         with self._sess_mu:
             already_on = uname in self._sessions
 
-        # always issue a challenge regardless of whether the user exists
+        # always send a challenge even for unknown users -- prevents username enumeration
         nonce = get_random_bytes(NONCE_BYTES)
         self._log("server", f"[auth] challenge (128-bit random) = {self._h(nonce)}")
         conn.send({"type": "CHALLENGE", "nonce_hex": self._h(nonce)})
@@ -357,8 +354,8 @@ class ChannelServer:
         client_mac = reply.get("mac_hex", "")
         self._log("server", f"[auth] received HMAC from client: {client_mac}")
 
-        # derive the ack encryption keys — we need these whether or not auth succeeds,
-        # so the failure response is indistinguishable from success in terms of wire format
+        # compute ack keys now regardless of outcome
+        # so success and failure produce identical looking wire messages
         if rec:
             try:
                 h_pw  = bytes.fromhex(rec["pw"])
@@ -368,8 +365,8 @@ class ChannelServer:
                 rec = None  # treat as unknown
 
         if rec:
-            hmac_key     = h_pw[:SYMKEY_LEN]   # HMAC key = first 32B of H(pw)
-            ack_k, ack_v = self._kiv(h_rpw)    # ack encryption keys from H(rev_pw)
+            hmac_key     = h_pw[:SYMKEY_LEN]   # first 32B of H(pw) = hmac key
+            ack_k, ack_v = self._kiv(h_rpw)    # ack enc keys from H(reversed pw)
             expected_mac = self._hmac(hmac_key, nonce)
             self._log("server", f"[auth] expected HMAC = {self._h(expected_mac)}")
             try:
@@ -377,12 +374,12 @@ class ChannelServer:
             except:
                 auth_ok = False
         else:
-            # user doesn't exist — use random keys so we can still send a ciphertext back
+            # unknown user -- random keys so we still return a valid looking ciphertext
             ack_k   = get_random_bytes(SYMKEY_LEN)
             ack_v   = get_random_bytes(BLOCK_SIZE)
             auth_ok = False
 
-        # closure captures ack_k and ack_v — cleaner than passing them everywhere
+        # closure so ack keys dont need to be passed into every branch
         def send_result(plaintext):
             ct  = self._aes_enc(ack_k, ack_v, plaintext)
             sig = self._sign(self._sig_key, ct)
@@ -414,7 +411,7 @@ class ChannelServer:
             send_result(CHAN_UNAVAIL)
             return None
 
-        # register the session — double-check under the lock in case of a race
+        # double check under lock in case two logins for the same user raced
         with self._sess_mu:
             if uname in self._sessions:
                 self._log("server", f"[auth] '{uname}' just appeared online (race condition), rejecting")
@@ -423,8 +420,8 @@ class ChannelServer:
             self._sessions[uname] = (conn, channel, addr)
         self._ev("sessions_changed", None)
 
-        # pack the channel keys into the success response
-        # format: AUTH_SUCCESS + 1B(channel name length) + channel name + aes_key + iv + hmac_key
+        # pack channel keys into success blob
+        # AUTH_SUCCESS + 1B(ch len) + ch name + aes key(32) + iv(16) + hmac key(32)
         ch_aes, ch_iv, ch_hmac = ck
         ch_b = channel.encode("utf-8")
         blob = AUTH_SUCCESS + bytes([len(ch_b)]) + ch_b + ch_aes + ch_iv + ch_hmac
@@ -432,7 +429,7 @@ class ChannelServer:
         self._log("server", f"[auth] '{uname}' is now authenticated on channel {channel}")
         return uname, channel
 
-    # enrollment handler
+    # enrollment
 
     def _enroll(self, conn, msg, addr):
         ct_hex = msg.get("enc_hex", "")
@@ -493,7 +490,7 @@ class ChannelServer:
             "sig_hex": self._h(sig)
         })
 
-    # handles one connection from start to finish
+    # one thread per client, handles whatever they send first
 
     def _client_session(self, raw_sock, addr):
         conn = Connection(raw_sock)
@@ -525,7 +522,7 @@ class ChannelServer:
                 self._log("server", f"'{username}' disconnected (was on {channel})")
             conn.close()
 
-    # accept new connections in a loop
+    # acceptor loop
 
     def _acceptor(self):
         while self._running:
@@ -537,7 +534,7 @@ class ChannelServer:
             t = threading.Thread(target=self._client_session, args=(raw, addr), daemon=True)
             t.start()
 
-    # db read / write
+    # simple json file db
 
     def _load_db(self):
         if not os.path.exists(ENROLL_DB):
@@ -646,7 +643,7 @@ class ServerGUI:
         body = tk.Frame(self.root, bg=C_BG)
         body.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
 
-        # left column: controls
+        # left panel
         left = tk.Frame(body, bg=C_BG)
         left.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 8))
 
@@ -697,7 +694,7 @@ class ServerGUI:
                                borderwidth=0, font=MONO)
         self._ul.pack(fill=tk.X, padx=6, pady=6)
 
-        # right: tabbed logs
+        # log tabs on the right
         nb = ttk.Notebook(body)
         nb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
@@ -713,7 +710,7 @@ class ServerGUI:
             nb.add(f, text=f"  {ch}  ")
             self._logs[ch] = t
 
-        # server log tab
+        # main server log (not channel specific)
         fs = ttk.Frame(nb)
         ts = tk.Text(fs, wrap=tk.WORD, bg=C_DEEP, fg=C_LITE,
                      insertbackground=C_FG, relief="flat",
@@ -783,7 +780,7 @@ class ServerGUI:
         self.root.destroy()
 
     def _drain(self):
-        # process everything in the queue, then reschedule
+        # drain queue then reschedule itself
         try:
             while True:
                 item = self._q.get_nowait()

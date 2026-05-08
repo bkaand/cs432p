@@ -1,5 +1,5 @@
-# CS432 / 532 Spring 2026
-# client side — enrollment, challenge-response login, secure broadcast
+# client 
+# mehmet emre tekesin - bilgekagan durmaz
 
 import json
 import queue
@@ -18,7 +18,7 @@ from Crypto.Util.Padding import pad, unpad
 
 CHANNELS = ("IF100", "MATH101", "SPS101")
 
-# GUI palette — light blue/slate
+# GUI palette — light blue
 C_BG   = "#f0f7ff"
 C_CARD = "#ffffff"
 C_BAND = "#dbeafe"
@@ -77,8 +77,8 @@ def _theme(root):
                 bordercolor=C_BG, arrowcolor=C_SUB, relief="flat")
 
 
-# single class handles everything — gui, session state, network, crypto.
-# background threads push events into self._eq; _tick() drains it every 40ms
+# everything in one class -- gui, session, network, crypto
+# threads push to self._eq and _tick() drains it every 40ms
 class SecureClient:
 
     def __init__(self):
@@ -88,22 +88,20 @@ class SecureClient:
         self.root.configure(bg=C_BG)
         _theme(self.root)
 
-        # session state — a single dict when logged in, None when not
-        # keys: "aes", "iv", "mac", "ch", "user"
+        # session dict when logged in, None when not -- keys: aes iv mac ch user
         self._sess  = None
-        self._conn  = None   # socket (kept open during broadcast phase)
-        self._alive = False  # True while receiver thread is running
+        self._conn  = None   # socket stays open during broadcast phase
+        self._alive = False  # receiver thread running
 
-        # server RSA public keys, loaded from PEM files before use
+        # server public keys, must be loaded before enrollment or login
         self._pub_enc = None
         self._pub_sig = None
 
-        # thread → main loop event queue
-        # events are tuples: (kind, *args)
+        # threads push events here, main thread drains with _tick()
         self._eq = queue.Queue()
         self.root.after(40, self._tick)
 
-        # tkinter form variables
+        # form fields
         self._v_enc   = tk.StringVar()
         self._v_sig   = tk.StringVar()
         self._v_ip    = tk.StringVar(value="127.0.0.1")
@@ -119,10 +117,10 @@ class SecureClient:
         self._build()
         self.root.protocol("WM_DELETE_WINDOW", self._quit)
 
-    # network I/O — 4-byte big-endian length prefix + JSON body
+    # 4 byte big-endian length prefix then JSON -- must match server framing
 
     def _readall(self, sock, n):
-        # pull exactly n bytes, blocking until we have them
+        # blocking read of exactly n bytes
         buf = b""
         while len(buf) < n:
             got = sock.recv(n - len(buf))
@@ -134,14 +132,14 @@ class SecureClient:
     def _net_recv(self, sock):
         size = struct.unpack(">I", self._readall(sock, 4))[0]
         if size == 0 or size > 16 * 1024 * 1024:
-            raise ValueError(f"frame size {size} looks wrong")
+            raise ValueError(f"frame size {size} out of range")
         return json.loads(self._readall(sock, size).decode("utf-8"))
 
     def _net_send(self, sock, data):
         raw = json.dumps(data, separators=(",", ":")).encode("utf-8")
         sock.sendall(struct.pack(">I", len(raw)) + raw)
 
-    # key loading — called from main thread so it can write to the log widget directly
+    # runs on main thread so it can write directly to the log widget
 
     def _load_keys(self, enc_path, sig_path):
         self._pub_enc = RSA.import_key(open(enc_path, "rb").read())
@@ -158,15 +156,14 @@ class SecureClient:
     # enrollment
 
     def _enroll_worker(self, ip, port, user, pw, ch):
-        # compute hashes; we send H(pw) and H(reversed pw), never the plaintext
+        # hash the password, never send it in the clear
         pw_hash  = SHA3_512.new(pw.encode()).digest()
         rpw_hash = SHA3_512.new(pw[::-1].encode()).digest()
         self._log(f"[enroll] H(pw)  = {pw_hash.hex().upper()}")
         self._log(f"[enroll] H(rpw) = {rpw_hash.hex().upper()}")
 
-        # binary payload — hashes first, then length-prefixed strings
-        # [64B H(pw)][64B H(rpw)][1B ulen][username][1B clen][channel]
-        # this order keeps it within RSA-3072 OAEP + SHA3-512's ~254B limit
+        # binary payload: [64B H(pw)][64B H(rpw)][1B ulen][username][1B clen][channel]
+        # hashes go first so the whole thing fits in rsa-3072 oaep (~254B max)
         ub = user.encode("utf-8")
         cb = ch.encode("utf-8")
         if not 1 <= len(ub) <= 32:
@@ -212,7 +209,7 @@ class SecureClient:
         self._log(f"[enroll] server says: '{msg}'")
         self._log(f"[enroll] signature (first 32B): {sig.hex().upper()[:64]}...")
 
-        # always check the signature before trusting the response
+        # always verify before trusting anything the server sends
         try:
             pkcs1_15.new(self._pub_sig).verify(SHA3_512.new(msg.encode("utf-8")), sig)
             self._log("[enroll] signature OK")
@@ -226,7 +223,7 @@ class SecureClient:
     # login — challenge-response, then stays open for broadcast
 
     def _login_worker(self, ip, port, user, pw):
-        # hash both pw and reversed pw upfront — used in HMAC and ack decryption
+        # compute both hashes now -- needed for HMAC and ack decryption
         pw_hash  = SHA3_512.new(pw.encode()).digest()
         rpw_hash = SHA3_512.new(pw[::-1].encode()).digest()
 
@@ -241,7 +238,7 @@ class SecureClient:
             self._log(f"[auth] LOGIN → '{user}'")
             self._net_send(sock, {"type": "LOGIN", "user": user})
 
-            # server responds with a random 128-bit nonce
+            # server sends back a random challenge nonce
             chal_msg = self._net_recv(sock)
             if chal_msg.get("type") != "CHALLENGE":
                 self._log(f"[auth] expected CHALLENGE, got {chal_msg.get('type')!r}")
@@ -250,7 +247,7 @@ class SecureClient:
             nonce = bytes.fromhex(chal_msg["nonce_hex"])
             self._log(f"[auth] challenge nonce = {nonce.hex().upper()}")
 
-            # HMAC key = first 32B of H(pw) — server derives the same from the stored hash
+            # hmac key = first 32B of H(pw), server derives the same from stored hash
             hmac_k = pw_hash[:32]
             tag    = CryptoHMAC.new(hmac_k, digestmod=SHA3_512)
             tag.update(nonce)
@@ -259,7 +256,7 @@ class SecureClient:
             self._log(f"[auth] HMAC response = {response.hex().upper()}")
             self._net_send(sock, {"type": "HMAC_RESP", "mac_hex": response.hex().upper()})
 
-            # server sends back an AES-encrypted, RSA-signed result
+            # get the AES encrypted and RSA signed result
             result = self._net_recv(sock)
             if result.get("type") != "LOGIN_RESULT":
                 self._log(f"[auth] expected LOGIN_RESULT, got {result.get('type')!r}")
@@ -270,7 +267,7 @@ class SecureClient:
             self._log(f"[auth] result ct  = {ct.hex().upper()[:48]}...")
             self._log(f"[auth] result sig = {sig.hex().upper()[:48]}...")
 
-            # always verify sig before decrypting
+            # verify signature before decrypting anything
             try:
                 pkcs1_15.new(self._pub_sig).verify(SHA3_512.new(ct), sig)
                 self._log("[auth] signature verified OK")
@@ -278,7 +275,7 @@ class SecureClient:
                 self._log("[auth] SIGNATURE FAILED — rejecting")
                 sock.close(); self._eq.put(("login_done", "auth_failed")); return
 
-            # ack is encrypted with key/IV from H(reversed password)
+            # ack enc key and iv come from H(reversed pw)
             wrap_k  = rpw_hash[:32]
             wrap_iv = rpw_hash[32:48]
             self._log(f"[auth] ack wrap key = {wrap_k.hex().upper()}")
@@ -288,7 +285,7 @@ class SecureClient:
                 pt = unpad(AES.new(wrap_k, AES.MODE_CBC, wrap_iv).decrypt(ct), 16)
             except ValueError:
                 # padding error = wrong key = wrong password
-                self._log("[auth] AES decryption failed — wrong password?")
+                self._log("[auth] AES decryption failed -- wrong password?")
                 sock.close(); self._eq.put(("login_done", "wrong_password")); return
 
             self._log(f"[auth] decrypted starts: {pt[:32].hex().upper()}...")
@@ -300,11 +297,11 @@ class SecureClient:
             self._eq.put(("login_done", "network_error"))
             return
 
-        # check which result the server sent
+        # check which result the server sent back
         if pt.startswith(b"Authentication Successful"):
             rest = pt[len(b"Authentication Successful"):]
 
-            # server payload: 1B(ch_len) + ch_name + aes_key(32) + iv(16) + hmac_key(32)
+            # 1B(ch len) + ch name + aes key(32) + iv(16) + hmac key(32)
             if len(rest) < 2:
                 self._log("[auth] success payload too short")
                 sock.close(); self._eq.put(("login_done", "auth_failed")); return
@@ -326,6 +323,7 @@ class SecureClient:
             self._log(f"[auth] AES IV    = {aes_iv.hex().upper()}")
             self._log(f"[auth] HMAC key  = {mac_k.hex().upper()}")
 
+            # store session in one dict, easy to wipe on logout
             self._sess = {
                 "aes":  aes_k,
                 "iv":   aes_iv,
@@ -387,7 +385,7 @@ class SecureClient:
             self._shutdown()
 
     def _listener(self):
-        # receives broadcast messages from the server in a background thread
+        # background receive loop, runs until disconnected
         while self._alive:
             try:
                 msg = self._net_recv(self._conn)
@@ -404,7 +402,7 @@ class SecureClient:
             tag = bytes.fromhex(msg.get("mac_hex", ""))
             self._log(f"[recv] '{sender}': ct = {ct.hex().upper()[:32]}...")
 
-            # check HMAC before touching plaintext
+            # check hmac before decrypting anything
             try:
                 chk = CryptoHMAC.new(self._sess["mac"], digestmod=SHA3_512)
                 chk.update(ct)
@@ -439,8 +437,7 @@ class SecureClient:
             except: pass
         self._conn = None
         self._sess = None
-        # tell main thread to reset the UI
-        self._eq.put(("disconnected",))
+        self._eq.put(("disconnected",))  # notify main thread
 
     def _disconnect(self):
         if self._alive and self._conn:
@@ -449,17 +446,17 @@ class SecureClient:
             except: pass
         self._shutdown()
 
-    # logging helpers — _log() is safe to call from any thread
+    # _log() queues the message so its safe to call from any thread
 
     def _log(self, text):
         self._eq.put(("log", text))
 
     def _write_log(self, text):
-        # called directly from the main thread (no queue needed)
+        # direct write, only call from main thread
         self._log_box.insert(tk.END, text + "\n")
         self._log_box.see(tk.END)
 
-    # drain the event queue — scheduled every 40ms on the main thread
+    # process queue events, reschedules itself every 40ms
 
     def _tick(self):
         try:
@@ -497,7 +494,7 @@ class SecureClient:
 
         self.root.after(40, self._tick)
 
-    # button handlers
+    # button clicks
 
     def _btn_load_keys(self):
         if not self._v_enc.get() or not self._v_sig.get():
@@ -706,7 +703,7 @@ class SecureClient:
 
         # messages tab
         chat = ttk.Frame(nb)
-        # send bar must be packed BEFORE the text box so it doesn't get hidden
+        # send bar goes first or the text widget expands and hides it
         send_bar = tk.Frame(chat, bg=C_BAND)
         send_bar.pack(side=tk.BOTTOM, fill=tk.X)
         self._compose = tk.StringVar()
