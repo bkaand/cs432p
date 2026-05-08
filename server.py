@@ -668,7 +668,9 @@ class ServerGUI:
 
         btns = tk.Frame(sf, bg=C_PANEL)
         btns.grid(row=3, column=0, columnspan=3, sticky="we", padx=8, pady=(4, 8))
-        self._btn_start = ttk.Button(btns, text="▶ Start", command=self._start)
+        self._btn_load_keys = ttk.Button(btns, text="Load Keys", command=self._load_keys)
+        self._btn_load_keys.pack(side=tk.LEFT, padx=(0, 6))
+        self._btn_start = ttk.Button(btns, text="▶ Start", command=self._start, state=tk.DISABLED)
         self._btn_start.pack(side=tk.LEFT, padx=(0, 6))
         self._btn_stop = ttk.Button(btns, text="■ Stop", command=self._stop, state=tk.DISABLED)
         self._btn_stop.pack(side=tk.LEFT)
@@ -735,6 +737,18 @@ class ServerGUI:
         if p:
             self._v_sig.set(p)
 
+    def _load_keys(self):
+        # Load RSA keypairs at server startup, before the listener is started.
+        if not self._v_enc.get() or not self._v_sig.get():
+            messagebox.showerror("Missing keys", "Please select both PEM files first.")
+            return
+        try:
+            self.srv.load_keypair(self._v_enc.get(), self._v_sig.get())
+            self._btn_load_keys.configure(state=tk.DISABLED)
+            self._btn_start.configure(state=tk.NORMAL)
+        except Exception as ex:
+            messagebox.showerror("Failed to load keys", str(ex))
+
     def _start(self):
         try:
             port = int(self._v_port.get())
@@ -743,11 +757,10 @@ class ServerGUI:
         except ValueError:
             messagebox.showerror("Bad port", "Port must be a number between 1 and 65535.")
             return
-        if not self._v_enc.get() or not self._v_sig.get():
-            messagebox.showerror("Missing keys", "Please select both PEM files first.")
+        if not self.srv._enc_key or not self.srv._sig_key:
+            messagebox.showerror("Keys not loaded", "Click 'Load Keys' before starting.")
             return
         try:
-            self.srv.load_keypair(self._v_enc.get(), self._v_sig.get())
             self.srv.listen(port)
         except Exception as ex:
             messagebox.showerror("Failed to start", str(ex))
