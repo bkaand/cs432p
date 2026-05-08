@@ -18,7 +18,7 @@ from Crypto.Util.Padding import pad, unpad
 
 CHANNELS = ("IF100", "MATH101", "SPS101")
 
-# GUI palette — light blue
+#  palette — light blue
 C_BG   = "#f0f7ff"
 C_CARD = "#ffffff"
 C_BAND = "#dbeafe"
