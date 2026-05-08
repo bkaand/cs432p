@@ -1,5 +1,5 @@
-# client 
-# mehmet emre tekesin - bilgekagan durmaz
+# cs432 term project - client
+# spring 2026
 
 import json
 import queue
@@ -16,9 +16,10 @@ from Crypto.Signature import pkcs1_15
 from Crypto.Util.Padding import pad, unpad
 
 
+# 3 channels (project doc says only these). pick one at enroll, cant change later
 CHANNELS = ("IF100", "MATH101", "SPS101")
 
-#  palette — light blue
+# light blue colors
 C_BG   = "#f0f7ff"
 C_CARD = "#ffffff"
 C_BAND = "#dbeafe"
@@ -77,31 +78,31 @@ def _theme(root):
                 bordercolor=C_BG, arrowcolor=C_SUB, relief="flat")
 
 
-# everything in one class -- gui, session, network, crypto
-# threads push to self._eq and _tick() drains it every 40ms
+# everything is in this class - gui, socket, keys, threads
+# workers push events into self._eq, main thread drains it cuz tk not thread safe
 class SecureClient:
 
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("CS432 — CLIENT")
+        self.root.title("CS432 - CLIENT")
         self.root.geometry("1100x860")
         self.root.configure(bg=C_BG)
         _theme(self.root)
 
-        # session dict when logged in, None when not -- keys: aes iv mac ch user
+        # session dict when logged in, None otherwise. keys: aes iv mac ch user
         self._sess  = None
-        self._conn  = None   # socket stays open during broadcast phase
-        self._alive = False  # receiver thread running
+        self._conn  = None   # socket open during broadcast
+        self._alive = False  # receiver thread on/off
 
-        # server public keys, must be loaded before enrollment or login
+        # server pub keys, load before enroll/login
         self._pub_enc = None
         self._pub_sig = None
 
-        # threads push events here, main thread drains with _tick()
+        # event q from worker threads
         self._eq = queue.Queue()
         self.root.after(40, self._tick)
 
-        # form fields
+        # form vars
         self._v_enc   = tk.StringVar()
         self._v_sig   = tk.StringVar()
         self._v_ip    = tk.StringVar(value="127.0.0.1")
@@ -111,16 +112,18 @@ class SecureClient:
         self._v_rchan = tk.StringVar(value=CHANNELS[0])
         self._v_luser = tk.StringVar()
         self._v_lpass = tk.StringVar()
-        self._v_stat  = tk.StringVar(value="● Not connected")
-        self._v_chanl = tk.StringVar(value="—")
+        self._v_stat  = tk.StringVar(value="Not connected")
+        self._v_chanl = tk.StringVar(value="-")
 
         self._build()
         self.root.protocol("WM_DELETE_WINDOW", self._quit)
 
-    # 4 byte big-endian length prefix then JSON -- must match server framing
+    # ---- socket io ----
+    # wire format: 4 byte length (big endian) then json body
+    # server uses same thing (its Connection class). dont touch this part
 
     def _readall(self, sock, n):
-        # blocking read of exactly n bytes
+        # read exactly n bytes
         buf = b""
         while len(buf) < n:
             got = sock.recv(n - len(buf))
@@ -139,7 +142,7 @@ class SecureClient:
         raw = json.dumps(data, separators=(",", ":")).encode("utf-8")
         sock.sendall(struct.pack(">I", len(raw)) + raw)
 
-    # runs on main thread so it can write directly to the log widget
+    # main thread only, writes to log widget directly
 
     def _load_keys(self, enc_path, sig_path):
         self._pub_enc = RSA.import_key(open(enc_path, "rb").read())
@@ -149,7 +152,7 @@ class SecureClient:
                                 ("sig", self._pub_sig, sig_path)):
             if k.has_private():
                 raise ValueError(
-                    f"{label} key at '{path}' is a private key — "
+                    f"{label} key at '{path}' is a private key - "
                     "only the server's PUBLIC key should be loaded here."
                 )
             self._write_log(f"{label} public key: {path}")
@@ -161,14 +164,14 @@ class SecureClient:
     # enrollment
 
     def _enroll_worker(self, ip, port, user, pw, ch):
-        # hash the password, never send it in the clear
+        # never send pw in clear, hash it first
         pw_hash  = SHA3_512.new(pw.encode()).digest()
         rpw_hash = SHA3_512.new(pw[::-1].encode()).digest()
         self._log(f"[enroll] H(pw)  = {pw_hash.hex().upper()}")
         self._log(f"[enroll] H(rpw) = {rpw_hash.hex().upper()}")
 
-        # binary payload: [64B H(pw)][64B H(rpw)][1B ulen][username][1B clen][channel]
-        # hashes go first so the whole thing fits in rsa-3072 oaep (~254B max)
+        # payload format = H(pw)[64] H(rpw)[64] ulen[1] username clen[1] channel
+        # we put hashes first cuz oaep can only fit ~254 bytes
         ub = user.encode("utf-8")
         cb = ch.encode("utf-8")
         if not 1 <= len(ub) <= 32:
@@ -214,21 +217,21 @@ class SecureClient:
         self._log(f"[enroll] server says: '{msg}'")
         self._log(f"[enroll] signature (first 32B): {sig.hex().upper()[:64]}...")
 
-        # always verify before trusting anything the server sends
+        # verify sig first, never trust the server reply otherwise
         try:
             pkcs1_15.new(self._pub_sig).verify(SHA3_512.new(msg.encode("utf-8")), sig)
             self._log("[enroll] signature OK")
         except Exception:
-            self._log("[enroll] SIGNATURE INVALID — discarding response")
+            self._log("[enroll] SIGNATURE INVALID - discarding response")
             self._eq.put(("enroll_done", False))
             return
 
         self._eq.put(("enroll_done", msg.startswith("success"), user, ch))
 
-    # login — challenge-response, then stays open for broadcast
+    # login = 3 msg challenge response. socket stays open after, handed to _listener
 
     def _login_worker(self, ip, port, user, pw):
-        # compute both hashes now -- needed for HMAC and ack decryption
+        # need both hashes (one for hmac, one for ack decrypt)
         pw_hash  = SHA3_512.new(pw.encode()).digest()
         rpw_hash = SHA3_512.new(pw[::-1].encode()).digest()
 
@@ -240,10 +243,10 @@ class SecureClient:
             return
 
         try:
-            self._log(f"[auth] LOGIN → '{user}'")
+            self._log(f"[auth] LOGIN -> '{user}'")
             self._net_send(sock, {"type": "LOGIN", "user": user})
 
-            # server sends back a random challenge nonce
+            # server replies with random challenge nonce
             chal_msg = self._net_recv(sock)
             if chal_msg.get("type") != "CHALLENGE":
                 self._log(f"[auth] expected CHALLENGE, got {chal_msg.get('type')!r}")
@@ -252,7 +255,7 @@ class SecureClient:
             nonce = bytes.fromhex(chal_msg["nonce_hex"])
             self._log(f"[auth] challenge nonce = {nonce.hex().upper()}")
 
-            # hmac key = lower half of H(pw) = bytes 32-63 (256-bit)
+            # hmac key = lower half of H(pw), bytes 32..63 (= 256 bit)
             hmac_k = pw_hash[32:]
             tag    = CryptoHMAC.new(hmac_k, digestmod=SHA3_512)
             tag.update(nonce)
@@ -261,7 +264,7 @@ class SecureClient:
             self._log(f"[auth] HMAC response = {response.hex().upper()}")
             self._net_send(sock, {"type": "HMAC_RESP", "mac_hex": response.hex().upper()})
 
-            # get the AES encrypted and RSA signed result
+            # AES encrypted + RSA signed result back from server
             result = self._net_recv(sock)
             if result.get("type") != "LOGIN_RESULT":
                 self._log(f"[auth] expected LOGIN_RESULT, got {result.get('type')!r}")
@@ -272,16 +275,16 @@ class SecureClient:
             self._log(f"[auth] result ct  = {ct.hex().upper()[:48]}...")
             self._log(f"[auth] result sig = {sig.hex().upper()[:48]}...")
 
-            # verify signature before decrypting anything
+            # check sig before doing anything
             try:
                 pkcs1_15.new(self._pub_sig).verify(SHA3_512.new(ct), sig)
                 self._log("[auth] signature verified OK")
             except Exception:
-                self._log("[auth] SIGNATURE FAILED — rejecting")
+                self._log("[auth] SIGNATURE FAILED - rejecting")
                 sock.close(); self._eq.put(("login_done", "auth_failed")); return
 
-            # ack enc key = lower half of H(rpw) = bytes 32-63
-            # ack IV      = 2nd quarter of H(rpw) = bytes 16-31 (lower half of upper half)
+            # ack enc key = lower half of H(rpw)  (bytes 32..63)
+            # ack iv = 2nd quarter of H(rpw)  (bytes 16..31, "lower half of upper half")
             wrap_k  = rpw_hash[32:]
             wrap_iv = rpw_hash[16:32]
             self._log(f"[auth] ack wrap key = {wrap_k.hex().upper()}")
@@ -290,7 +293,7 @@ class SecureClient:
             try:
                 pt = unpad(AES.new(wrap_k, AES.MODE_CBC, wrap_iv).decrypt(ct), 16)
             except ValueError:
-                # padding error = wrong key = wrong password
+                # pad error = wrong key = wrong pw most likely
                 self._log("[auth] AES decryption failed -- wrong password?")
                 sock.close(); self._eq.put(("login_done", "wrong_password")); return
 
@@ -303,11 +306,11 @@ class SecureClient:
             self._eq.put(("login_done", "network_error"))
             return
 
-        # check which result the server sent back
+        # see what server sent
         if pt.startswith(b"Authentication Successful"):
             rest = pt[len(b"Authentication Successful"):]
 
-            # 1B(ch len) + ch name + aes key(32) + iv(16) + hmac key(32)
+            # rest = clen(1) + channel + aes(32) + iv(16) + hmac(32)
             if len(rest) < 2:
                 self._log("[auth] success payload too short")
                 sock.close(); self._eq.put(("login_done", "auth_failed")); return
@@ -324,12 +327,12 @@ class SecureClient:
             aes_iv = rest[off + 32:off + 48]
             mac_k  = rest[off + 48:off + 80]
 
-            self._log(f"[auth] ✓ channel = {ch_name}")
+            self._log(f"[auth] OK channel = {ch_name}")
             self._log(f"[auth] AES key   = {aes_k.hex().upper()}")
             self._log(f"[auth] AES IV    = {aes_iv.hex().upper()}")
             self._log(f"[auth] HMAC key  = {mac_k.hex().upper()}")
 
-            # store session in one dict, easy to wipe on logout
+            # one dict for session, makes logout simple (just None)
             self._sess = {
                 "aes":  aes_k,
                 "iv":   aes_iv,
@@ -358,14 +361,14 @@ class SecureClient:
         sock.close()
         self._eq.put(("login_done", "auth_failed"))
 
-    # broadcast — send and receive
+    # ---- broadcast send/recv ----
 
     def _send_msg(self):
         text = self._compose.get().strip()
         if not text:
             return
         if not self._alive or not self._sess:
-            self._log("can't send — not logged in")
+            self._log("can't send - not logged in")
             return
 
         try:
@@ -391,7 +394,7 @@ class SecureClient:
             self._shutdown()
 
     def _listener(self):
-        # background receive loop, runs until disconnected
+        # bg recv loop, runs til disconnect
         while self._alive:
             try:
                 msg = self._net_recv(self._conn)
@@ -408,14 +411,14 @@ class SecureClient:
             tag = bytes.fromhex(msg.get("mac_hex", ""))
             self._log(f"[recv] '{sender}': ct = {ct.hex().upper()[:32]}...")
 
-            # check hmac before decrypting anything
+            # hmac first then decrypt - encrypt-then-mac
             try:
                 chk = CryptoHMAC.new(self._sess["mac"], digestmod=SHA3_512)
                 chk.update(ct)
                 chk.verify(tag)
             except Exception:
-                self._log(f"[recv] HMAC invalid — dropping message from '{sender}'")
-                self._eq.put(("incoming", sender, "<<HMAC INVALID — dropped>>"))
+                self._log(f"[recv] HMAC invalid - dropping message from '{sender}'")
+                self._eq.put(("incoming", sender, "<<HMAC INVALID - dropped>>"))
                 continue
 
             try:
@@ -443,7 +446,7 @@ class SecureClient:
             except: pass
         self._conn = None
         self._sess = None
-        self._eq.put(("disconnected",))  # notify main thread
+        self._eq.put(("disconnected",))  # tell main thread
 
     def _disconnect(self):
         if self._alive and self._conn:
@@ -452,17 +455,17 @@ class SecureClient:
             except: pass
         self._shutdown()
 
-    # _log() queues the message so its safe to call from any thread
+    # _log queues msg, safe from any thread
 
     def _log(self, text):
         self._eq.put(("log", text))
 
     def _write_log(self, text):
-        # direct write, only call from main thread
+        # main thread only!! direct widget write
         self._log_box.insert(tk.END, text + "\n")
         self._log_box.see(tk.END)
 
-    # process queue events, reschedules itself every 40ms
+    # drain queue, reschedule every 40ms
 
     def _tick(self):
         try:
@@ -500,7 +503,7 @@ class SecureClient:
 
         self.root.after(40, self._tick)
 
-    # button clicks
+    # button handlers
 
     def _btn_load_keys(self):
         if not self._v_enc.get() or not self._v_sig.get():
@@ -543,7 +546,7 @@ class SecureClient:
             messagebox.showerror("Missing input", "Username and password required.")
             return
         self._login_btn.configure(state=tk.DISABLED)
-        self._set_status("● Authenticating...", C_ACC)
+        self._set_status("Authenticating...", C_ACC)
         threading.Thread(
             target=self._login_worker,
             args=(ip, port, user, pw),
@@ -560,11 +563,11 @@ class SecureClient:
             if not 1 <= port <= 65535:
                 raise ValueError
         except ValueError:
-            messagebox.showerror("Bad port", "Port must be 1–65535.")
+            messagebox.showerror("Bad port", "Port must be 1-65535.")
             return None
         return ip, port
 
-    # UI state changes
+    # ui updates after async stuff
 
     def _on_login_result(self, result):
         self._v_lpass.set("")
@@ -575,34 +578,34 @@ class SecureClient:
             self._send_btn.configure(state=tk.NORMAL)
             self._disc_btn.configure(state=tk.NORMAL)
             self._login_btn.configure(state=tk.DISABLED)
-            self._set_status(f"● {user} @ {ch}", C_OK)
+            self._set_status(f"{user} @ {ch}", C_OK)
         elif result == "wrong_password":
             messagebox.showerror("Wrong password",
-                                 "Decryption failed — check your password.")
-            self._set_status("● Not connected", C_ERR)
+                                 "Decryption failed - check your password.")
+            self._set_status("Not connected", C_ERR)
             self._login_btn.configure(state=tk.NORMAL)
         elif result == "auth_failed":
             messagebox.showerror("Auth failed",
                                  "Server rejected the credentials.")
-            self._set_status("● Not connected", C_ERR)
+            self._set_status("Not connected", C_ERR)
             self._login_btn.configure(state=tk.NORMAL)
         elif result == "channel_unavailable":
             messagebox.showwarning("Channel not ready",
                                    "Server hasn't generated keys for this channel yet.")
-            self._set_status("● Not connected", C_ERR)
+            self._set_status("Not connected", C_ERR)
             self._login_btn.configure(state=tk.NORMAL)
         else:
             messagebox.showerror("Connection error",
                                  "Could not reach the server. See crypto log.")
-            self._set_status("● Not connected", C_ERR)
+            self._set_status("Not connected", C_ERR)
             self._login_btn.configure(state=tk.NORMAL)
 
     def _on_disconnected(self):
-        self._set_status("● Not connected", C_ERR)
+        self._set_status("Not connected", C_ERR)
         self._send_btn.configure(state=tk.DISABLED)
         self._login_btn.configure(state=tk.NORMAL)
         self._disc_btn.configure(state=tk.DISABLED)
-        self._v_chanl.set("—")
+        self._v_chanl.set("-")
         self._alive = False
         self._conn  = None
         self._sess  = None
@@ -611,10 +614,10 @@ class SecureClient:
         self._v_stat.set(text)
         self._status_badge.configure(fg=color)
 
-    # build the window
+    # gui layout
 
     def _build(self):
-        # top banner
+        # banner
         banner = tk.Frame(self.root, bg=C_ACC, height=58)
         banner.pack(fill=tk.X)
         banner.pack_propagate(False)
@@ -630,11 +633,11 @@ class SecureClient:
         body = tk.Frame(self.root, bg=C_BG)
         body.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
 
-        # left column — form panels
+        # left side = forms
         left = tk.Frame(body, bg=C_BG)
         left.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 8))
 
-        # key loading
+        # keys block
         kf = ttk.LabelFrame(left, text="SERVER KEYS & CONNECTION")
         kf.pack(fill=tk.X, pady=(0, 6))
 
@@ -645,7 +648,7 @@ class SecureClient:
             ttk.Entry(parent, textvariable=var, width=28, **kw).grid(
                 row=row, column=1, sticky="we", padx=4)
             if browse:
-                ttk.Button(parent, text="…", command=browse, width=3).grid(
+                ttk.Button(parent, text="...", command=browse, width=3).grid(
                     row=row, column=2, padx=(0, 8))
 
         field(kf, "Enc PEM:",   self._v_enc,  0,
@@ -663,7 +666,7 @@ class SecureClient:
                    command=self._btn_load_keys).grid(
             row=4, column=0, columnspan=3, sticky="we", padx=10, pady=(4, 10))
 
-        # enrollment
+        # enroll block
         ef = ttk.LabelFrame(left, text="ENROLLMENT")
         ef.pack(fill=tk.X, pady=(0, 6))
         field(ef, "Username:", self._v_ruser, 0)
@@ -678,7 +681,7 @@ class SecureClient:
                    command=self._btn_enroll).grid(
             row=3, column=0, columnspan=3, sticky="we", padx=10, pady=(4, 10))
 
-        # login
+        # login block
         lf = ttk.LabelFrame(left, text="LOGIN")
         lf.pack(fill=tk.X, pady=(0, 6))
         field(lf, "Username:", self._v_luser, 0)
@@ -695,7 +698,7 @@ class SecureClient:
                                     state=tk.DISABLED)
         self._disc_btn.pack(side=tk.LEFT)
 
-        # channel indicator
+        # current channel label
         ci = tk.Frame(left, bg=C_BAND, padx=10, pady=6)
         ci.pack(fill=tk.X, pady=(0, 6))
         tk.Label(ci, text="Channel:", bg=C_BAND, fg=C_DARK,
@@ -703,13 +706,13 @@ class SecureClient:
         tk.Label(ci, textvariable=self._v_chanl, bg=C_BAND, fg=C_DARK,
                  font=(FONT[0], 9, "bold")).pack(side=tk.LEFT, padx=(4, 0))
 
-        # right side — notebook
+        # right side = tabs (messages + log)
         nb = ttk.Notebook(body)
         nb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         # messages tab
         chat = ttk.Frame(nb)
-        # send bar goes first or the text widget expands and hides it
+        # send bar must be packed first or text widget eats the space
         send_bar = tk.Frame(chat, bg=C_BAND)
         send_bar.pack(side=tk.BOTTOM, fill=tk.X)
         self._compose = tk.StringVar()
@@ -717,7 +720,7 @@ class SecureClient:
         self._compose_entry.pack(side=tk.LEFT, fill=tk.X, expand=True,
                                  padx=(8, 4), pady=8)
         self._compose_entry.bind("<Return>", lambda _: self._send_msg())
-        self._send_btn = ttk.Button(send_bar, text="Send ▶",
+        self._send_btn = ttk.Button(send_bar, text="Send",
                                     command=self._send_msg, state=tk.DISABLED)
         self._send_btn.pack(side=tk.LEFT, padx=(0, 8), pady=8)
 
@@ -731,7 +734,7 @@ class SecureClient:
         msg_scr.configure(command=self._msg_box.yview)
         nb.add(chat, text="  Messages  ")
 
-        # crypto log tab
+        # crypto log tab (showing all the hex stuff)
         logf = ttk.Frame(nb)
         log_scr = ttk.Scrollbar(logf)
         log_scr.pack(side=tk.RIGHT, fill=tk.Y)
