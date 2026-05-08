@@ -147,6 +147,11 @@ class SecureClient:
 
         for label, k, path in (("enc", self._pub_enc, enc_path),
                                 ("sig", self._pub_sig, sig_path)):
+            if k.has_private():
+                raise ValueError(
+                    f"{label} key at '{path}' is a private key — "
+                    "only the server's PUBLIC key should be loaded here."
+                )
             self._write_log(f"{label} public key: {path}")
             nb = k.n.to_bytes(384, "big")
             eb = k.e.to_bytes((k.e.bit_length() + 7) // 8, "big")
