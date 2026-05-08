@@ -365,8 +365,9 @@ class ChannelServer:
                 rec = None  # treat as unknown
 
         if rec:
-            hmac_key     = h_pw[:SYMKEY_LEN]   # first 32B of H(pw) = hmac key
-            ack_k, ack_v = self._kiv(h_rpw)    # ack enc keys from H(reversed pw)
+            hmac_key     = h_pw[SYMKEY_LEN:]               # lower half of H(pw) = bytes 32-63
+            ack_k        = h_rpw[SYMKEY_LEN:]               # lower half of H(rpw) = AES-256 key
+            ack_v        = h_rpw[BLOCK_SIZE:SYMKEY_LEN]     # 2nd quarter of H(rpw) = IV (bytes 16-31)
             expected_mac = self._hmac(hmac_key, nonce)
             self._log("server", f"[auth] expected HMAC = {self._h(expected_mac)}")
             try:

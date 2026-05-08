@@ -252,8 +252,8 @@ class SecureClient:
             nonce = bytes.fromhex(chal_msg["nonce_hex"])
             self._log(f"[auth] challenge nonce = {nonce.hex().upper()}")
 
-            # hmac key = first 32B of H(pw), server derives the same from stored hash
-            hmac_k = pw_hash[:32]
+            # hmac key = lower half of H(pw) = bytes 32-63 (256-bit)
+            hmac_k = pw_hash[32:]
             tag    = CryptoHMAC.new(hmac_k, digestmod=SHA3_512)
             tag.update(nonce)
             response = tag.digest()
@@ -280,9 +280,10 @@ class SecureClient:
                 self._log("[auth] SIGNATURE FAILED — rejecting")
                 sock.close(); self._eq.put(("login_done", "auth_failed")); return
 
-            # ack enc key and iv come from H(reversed pw)
-            wrap_k  = rpw_hash[:32]
-            wrap_iv = rpw_hash[32:48]
+            # ack enc key = lower half of H(rpw) = bytes 32-63
+            # ack IV      = 2nd quarter of H(rpw) = bytes 16-31 (lower half of upper half)
+            wrap_k  = rpw_hash[32:]
+            wrap_iv = rpw_hash[16:32]
             self._log(f"[auth] ack wrap key = {wrap_k.hex().upper()}")
             self._log(f"[auth] ack wrap IV  = {wrap_iv.hex().upper()}")
 

@@ -50,8 +50,14 @@ def hmac_ok(key, data, tag):
         return False
 
 def kiv(h64: bytes):
-    # first 32 = AES key, next 16 = IV
+    # channel key derivation: first 32 bytes = AES key, next 16 bytes = IV
     return h64[:32], h64[32:48]
+
+def auth_wrap_kiv(h_rpw: bytes):
+    # auth-ack key derivation from H(reversed password):
+    # lower half (bytes 32-63) = AES-256 key
+    # 2nd quarter (bytes 16-31, lower half of upper half) = IV
+    return h_rpw[32:], h_rpw[16:32]
 
 def pack_enroll(username, h_pw, h_rpw, channel):
     # [64B H(pw)] [64B H(rpw)] [1B ulen] [username] [1B clen] [channel]
@@ -399,11 +405,12 @@ class TestKeyDerivation(unittest.TestCase):
 
     def test_hmac_key_length(self):
         h_pw = sha3(b"somepassword")
-        self.assertEqual(len(h_pw[:32]), 32)
+        # lower half of H(pw) = bytes 32-63
+        self.assertEqual(len(h_pw[32:]), 32)
 
     def test_ack_key_and_iv_lengths(self):
         h_rpw = sha3(b"drowssap")
-        wrap_k, wrap_iv = kiv(h_rpw)
+        wrap_k, wrap_iv = auth_wrap_kiv(h_rpw)
         self.assertEqual(len(wrap_k),  32)
         self.assertEqual(len(wrap_iv), 16)
 
@@ -411,7 +418,7 @@ class TestKeyDerivation(unittest.TestCase):
         pw    = "testpassword"
         h_pw  = sha3(pw.encode())
         h_rpw = sha3(pw[::-1].encode())
-        self.assertNotEqual(h_pw[:32], h_rpw[:32])
+        self.assertNotEqual(h_pw[32:], h_rpw[32:])
 
     def test_channel_key_derivation_lengths(self):
         master  = "channelmaster"
@@ -511,7 +518,7 @@ class TestChallengeResponse(unittest.TestCase):
     def test_correct_password_verifies(self):
         pw      = "correctpassword"
         h_pw    = sha3(pw.encode())
-        hmac_k  = h_pw[:32]
+        hmac_k  = h_pw[32:]   # lower half of H(pw)
         nonce   = get_random_bytes(16)
         mac     = hmac_tag(hmac_k, nonce)
         self.assertTrue(hmac_ok(hmac_k, nonce, mac))
@@ -520,12 +527,12 @@ class TestChallengeResponse(unittest.TestCase):
         right_pw  = "rightpassword"
         wrong_pw  = "wrongpassword"
         nonce     = get_random_bytes(16)
-        mac       = hmac_tag(sha3(right_pw.encode())[:32], nonce)
-        self.assertFalse(hmac_ok(sha3(wrong_pw.encode())[:32], nonce, mac))
+        mac       = hmac_tag(sha3(right_pw.encode())[32:], nonce)
+        self.assertFalse(hmac_ok(sha3(wrong_pw.encode())[32:], nonce, mac))
 
     def test_replay_with_different_nonce_fails(self):
         pw     = "somepassword"
-        hmac_k = sha3(pw.encode())[:32]
+        hmac_k = sha3(pw.encode())[32:]   # lower half of H(pw)
         n1     = get_random_bytes(16)
         n2     = b"\xff" * 16   # guaranteed to differ from n1
         mac    = hmac_tag(hmac_k, n1)
@@ -543,7 +550,7 @@ class TestChallengeResponse(unittest.TestCase):
         # server encrypts ack with keys from H(reversed pw)
         pw     = "mypassword"
         h_rpw  = sha3(pw[::-1].encode())
-        wrap_k, wrap_iv = kiv(h_rpw)
+        wrap_k, wrap_iv = auth_wrap_kiv(h_rpw)
 
         plaintext = AUTH_SUCCESS + b"\x05IF100" + get_random_bytes(80)
         ct        = aes_enc(wrap_k, wrap_iv, plaintext)
@@ -555,8 +562,8 @@ class TestChallengeResponse(unittest.TestCase):
         wrong_pw = "wrong"
         h_rpw_r  = sha3(right_pw[::-1].encode())
         h_rpw_w  = sha3(wrong_pw[::-1].encode())
-        wrap_k_r, wrap_iv_r = kiv(h_rpw_r)
-        wrap_k_w, wrap_iv_w = kiv(h_rpw_w)
+        wrap_k_r, wrap_iv_r = auth_wrap_kiv(h_rpw_r)
+        wrap_k_w, wrap_iv_w = auth_wrap_kiv(h_rpw_w)
 
         ct = aes_enc(wrap_k_r, wrap_iv_r, AUTH_SUCCESS + b"\x00" * 80)
         with self.assertRaises(Exception):
@@ -745,8 +752,8 @@ class TestAuthIntegration(unittest.TestCase):
             reply = framing_recv(srv)
             client_mac = bytes.fromhex(reply["mac_hex"])
 
-            hmac_key     = h_pw_stored[:32]
-            ack_k, ack_v = kiv(h_rpw_stored)
+            hmac_key     = h_pw_stored[32:]          # lower half of H(pw)
+            ack_k, ack_v = auth_wrap_kiv(h_rpw_stored)
             auth_ok      = hmac_ok(hmac_key, nonce, client_mac)
 
             if auth_ok:
@@ -778,7 +785,7 @@ class TestAuthIntegration(unittest.TestCase):
         framing_send(cli, {"type": "LOGIN", "user": "testuser"})
         chal     = framing_recv(cli)
         nonce    = bytes.fromhex(chal["nonce_hex"])
-        mac      = hmac_tag(self.h_pw[:32], nonce)
+        mac      = hmac_tag(self.h_pw[32:], nonce)   # lower half of H(pw)
         framing_send(cli, {"type": "HMAC_RESP", "mac_hex": mac.hex().upper()})
 
         result   = framing_recv(cli)
@@ -786,7 +793,7 @@ class TestAuthIntegration(unittest.TestCase):
         sig      = bytes.fromhex(result["sig_hex"])
         pkcs1_15.new(self.sig_pub).verify(SHA3_512.new(ct), sig)
 
-        wrap_k, wrap_iv = kiv(self.h_rpw)
+        wrap_k, wrap_iv = auth_wrap_kiv(self.h_rpw)
         pt = aes_dec(wrap_k, wrap_iv, ct)
 
         status, ch, k, iv, mk = parse_auth_result(pt)
@@ -813,14 +820,14 @@ class TestAuthIntegration(unittest.TestCase):
         chal       = framing_recv(cli)
         nonce      = bytes.fromhex(chal["nonce_hex"])
         wrong_h_pw = sha3(b"totallyWrongPassword")
-        mac        = hmac_tag(wrong_h_pw[:32], nonce)
+        mac        = hmac_tag(wrong_h_pw[32:], nonce)   # lower half of H(wrong pw)
         framing_send(cli, {"type": "HMAC_RESP", "mac_hex": mac.hex().upper()})
 
         result   = framing_recv(cli)
         ct       = bytes.fromhex(result["ct_hex"])
 
         # client tries to decrypt with correct reversed pw -- should fail or give FAILURE
-        wrap_k, wrap_iv = kiv(self.h_rpw)
+        wrap_k, wrap_iv = auth_wrap_kiv(self.h_rpw)
         try:
             pt = aes_dec(wrap_k, wrap_iv, ct)
             # if decryption doesnt raise, plaintext should be failure
@@ -828,6 +835,205 @@ class TestAuthIntegration(unittest.TestCase):
             self.assertEqual(status, "fail")
         except Exception:
             pass  # padding error is also acceptable for wrong password
+
+        cli.close()
+        t.join(timeout=3)
+
+
+# -------------------------------------------------------------------
+# 10. auth_wrap_kiv byte positions (spec compliance)
+# -------------------------------------------------------------------
+
+class TestAuthWrapKiv(unittest.TestCase):
+
+    def test_key_is_lower_half(self):
+        # AES key must be the lower half of H(rpw), i.e. bytes 32-63
+        h = get_random_bytes(64)
+        k, _ = auth_wrap_kiv(h)
+        self.assertEqual(k, h[32:])
+
+    def test_iv_is_second_quarter(self):
+        # IV must be the 2nd quarter of H(rpw), i.e. bytes 16-31
+        h = get_random_bytes(64)
+        _, iv = auth_wrap_kiv(h)
+        self.assertEqual(iv, h[16:32])
+
+    def test_key_and_iv_do_not_overlap(self):
+        h = get_random_bytes(64)
+        k, iv = auth_wrap_kiv(h)
+        self.assertNotEqual(k, iv)
+        # bytes 16-31 and bytes 32-63 share no overlap
+        self.assertEqual(len(k),  32)
+        self.assertEqual(len(iv), 16)
+
+    def test_auth_wrap_differs_from_channel_kiv(self):
+        # auth-ack key derivation must produce different slices than channel key derivation
+        h = get_random_bytes(64)
+        ch_k,   ch_iv   = kiv(h)           # channel: bytes 0-31, 32-47
+        ack_k,  ack_iv  = auth_wrap_kiv(h) # auth:    bytes 32-63, 16-31
+        self.assertNotEqual(ch_k,  ack_k)
+        self.assertNotEqual(ch_iv, ack_iv)
+
+    def test_using_wrong_half_as_hmac_key_fails(self):
+        # if the client accidentally uses the UPPER half of H(pw) for the HMAC,
+        # the server (which uses the LOWER half) will reject it
+        pw     = "demopassword"
+        h_pw   = sha3(pw.encode())
+        nonce  = get_random_bytes(16)
+        correct_key = h_pw[32:]   # lower half -- what both sides must use
+        wrong_key   = h_pw[:32]   # upper half -- wrong
+        mac_with_wrong_key = hmac_tag(wrong_key, nonce)
+        self.assertFalse(hmac_ok(correct_key, nonce, mac_with_wrong_key))
+
+    def test_using_wrong_half_as_wrap_key_cant_decrypt(self):
+        # server encrypts ack with lower-half key; using upper-half key to decrypt fails
+        pw    = "demopassword"
+        h_rpw = sha3(pw[::-1].encode())
+        correct_k, correct_iv = auth_wrap_kiv(h_rpw)
+        wrong_k = h_rpw[:32]   # upper half
+        ct = aes_enc(correct_k, correct_iv, AUTH_SUCCESS + b"\x00" * 80)
+        with self.assertRaises(Exception):
+            aes_dec(wrong_k, correct_iv, ct)
+
+
+# -------------------------------------------------------------------
+# 11. Channel isolation (TC30/31)
+# -------------------------------------------------------------------
+
+class TestChannelIsolation(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        # derive independent keys for two channels from different master secrets
+        for ch, master in (("IF100", "if100-secret-demo"),
+                           ("MATH101", "math101-secret-demo")):
+            h_fwd = sha3(master.encode())
+            h_rev = sha3(master[::-1].encode())
+            setattr(cls, f"aes_k_{ch}",  h_fwd[:32])
+            setattr(cls, f"aes_iv_{ch}", h_fwd[32:48])
+            setattr(cls, f"hmac_k_{ch}", h_rev[:32])
+
+    def test_different_masters_produce_different_channel_keys(self):
+        self.assertNotEqual(self.aes_k_IF100,  self.aes_k_MATH101)
+        self.assertNotEqual(self.aes_iv_IF100, self.aes_iv_MATH101)
+        self.assertNotEqual(self.hmac_k_IF100, self.hmac_k_MATH101)
+
+    def test_cross_channel_hmac_fails(self):
+        # message from IF100 must not pass HMAC check with MATH101 key
+        ct  = aes_enc(self.aes_k_IF100, self.aes_iv_IF100, b"hello IF100")
+        tag = hmac_tag(self.hmac_k_IF100, ct)
+        self.assertFalse(hmac_ok(self.hmac_k_MATH101, ct, tag))
+
+    def test_cross_channel_decrypt_fails(self):
+        # ciphertext from IF100 cannot be correctly decrypted with MATH101 keys
+        ct = aes_enc(self.aes_k_IF100, self.aes_iv_IF100, b"confidential IF100 message")
+        with self.assertRaises(Exception):
+            aes_dec(self.aes_k_MATH101, self.aes_iv_MATH101, ct)
+
+    def test_same_channel_both_users_can_decrypt(self):
+        # user1 and user2 both have IF100 keys -- both must decrypt the same ciphertext
+        msg = "broadcast to IF100"
+        ct  = aes_enc(self.aes_k_IF100, self.aes_iv_IF100, msg.encode())
+        tag = hmac_tag(self.hmac_k_IF100, ct)
+        # user1 verifies + decrypts
+        self.assertTrue(hmac_ok(self.hmac_k_IF100, ct, tag))
+        self.assertEqual(aes_dec(self.aes_k_IF100, self.aes_iv_IF100, ct), msg.encode())
+        # user2 (same keys) does the same
+        self.assertTrue(hmac_ok(self.hmac_k_IF100, ct, tag))
+        self.assertEqual(aes_dec(self.aes_k_IF100, self.aes_iv_IF100, ct), msg.encode())
+
+
+# -------------------------------------------------------------------
+# 12. TCP framing robustness (TC3 / invalid frame sizes)
+# -------------------------------------------------------------------
+
+class TestFramingRobustness(unittest.TestCase):
+
+    def test_rejects_zero_size_frame(self):
+        a, b = socket_pair()
+        try:
+            a.sendall(struct.pack(">I", 0))  # size=0 is invalid
+            with self.assertRaises((ValueError, ConnectionError)):
+                framing_recv(b)
+        finally:
+            a.close(); b.close()
+
+    def test_rejects_oversized_frame(self):
+        a, b = socket_pair()
+        try:
+            a.sendall(struct.pack(">I", 16 * 1024 * 1024 + 1))  # > 16 MB limit
+            with self.assertRaises((ValueError, ConnectionError)):
+                framing_recv(b)
+        finally:
+            a.close(); b.close()
+
+    def test_partial_send_is_reassembled(self):
+        # framing_recv must handle the case where the payload arrives in small chunks
+        a, b = socket_pair()
+        try:
+            payload = {"type": "MSG", "data": "x" * 200}
+            raw     = json.dumps(payload, separators=(",", ":")).encode()
+            header  = struct.pack(">I", len(raw))
+            # send header and body in two separate calls to force partial read
+            a.sendall(header)
+            a.sendall(raw[:50])
+            a.sendall(raw[50:])
+            msg = framing_recv(b)
+            self.assertEqual(msg["data"], "x" * 200)
+        finally:
+            a.close(); b.close()
+
+
+# -------------------------------------------------------------------
+# 13. Channel Unavailable auth path (TC9)
+# -------------------------------------------------------------------
+
+class TestChannelUnavailable(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.sig_key = RSA.generate(2048)
+        cls.sig_pub = cls.sig_key.publickey()
+        cls.pw      = "unavailpassword"
+        cls.h_pw    = sha3(cls.pw.encode())
+        cls.h_rpw   = sha3(cls.pw[::-1].encode())
+
+    def test_channel_unavailable_response_parsed(self):
+        cli, srv = socket_pair()
+
+        def server_thread():
+            try:
+                framing_recv(srv)        # LOGIN
+                nonce = get_random_bytes(16)
+                framing_send(srv, {"type": "CHALLENGE", "nonce_hex": nonce.hex().upper()})
+                framing_recv(srv)        # HMAC_RESP -- verify is skipped to isolate this path
+                ack_k, ack_v = auth_wrap_kiv(self.h_rpw)
+                ct  = aes_enc(ack_k, ack_v, CHAN_UNAVAIL)
+                sig = pkcs1_15.new(self.sig_key).sign(SHA3_512.new(ct))
+                framing_send(srv, {"type": "LOGIN_RESULT",
+                                   "ct_hex": ct.hex().upper(),
+                                   "sig_hex": sig.hex().upper()})
+            finally:
+                srv.close()
+
+        t = threading.Thread(target=server_thread, daemon=True)
+        t.start()
+
+        framing_send(cli, {"type": "LOGIN", "user": "user_no_keys"})
+        chal  = framing_recv(cli)
+        nonce = bytes.fromhex(chal["nonce_hex"])
+        mac   = hmac_tag(self.h_pw[32:], nonce)
+        framing_send(cli, {"type": "HMAC_RESP", "mac_hex": mac.hex().upper()})
+
+        result  = framing_recv(cli)
+        ct      = bytes.fromhex(result["ct_hex"])
+        sig     = bytes.fromhex(result["sig_hex"])
+        pkcs1_15.new(self.sig_pub).verify(SHA3_512.new(ct), sig)
+
+        ack_k, ack_v = auth_wrap_kiv(self.h_rpw)
+        pt = aes_dec(ack_k, ack_v, ct)
+        status, *_ = parse_auth_result(pt)
+        self.assertEqual(status, "unavail")
 
         cli.close()
         t.join(timeout=3)
